@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/32878636/README.md)
 # ProofMark
 
 Darkroom contact-sheet proofing with wax grease-pencil marks (Fedora, PySide6).

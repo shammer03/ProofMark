@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ProofMark
+GenericName=Contact Sheet Proofing
+Comment=Darkroom contact sheet marking with wax grease pencil
+Exec=proofmark
+Icon=io.github.shammer03.ProofMark
+Terminal=false
+Categories=Graphics;Photography;
+Keywords=film;contact sheet;proof;darkroom;photography;
+StartupWMClass=io.github.shammer03.ProofMark
+StartupNotify=true
