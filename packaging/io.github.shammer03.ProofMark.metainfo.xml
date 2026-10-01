@@ -25,6 +25,9 @@
   <url type="bugtracker">https://github.com/shammer03/ProofMark/issues</url>
   <!-- TODO: add at least one <screenshot> (required by Flathub) -->
   <releases>
+    <release version="1.2.1" date="2026-10-01">
+      <description><ul><li>Loupe and Mark modes with the same viewing controls</li><li>Wheel grows the loupe to 95%, then zooms the photo to 200%</li><li>Click zooms; drag draws (Mark) or moves the photo (Loupe)</li><li>Sync modes: auto, on close or manual</li><li>Line stabiliser and rebalanced brush sizes</li><li>Undo / redo and rotate buttons; full lens names</li><li>Fixes: font setting, quitting with a window open</li></ul></description>
+    </release>
     <release version="1.2.0" date="2026-10-01">
       <description><ul><li>Keyboard culling: ratings, rejects and frame notes</li><li>Undo and redo for all edits</li><li>Show filter and optional marked contact sheets</li><li>Pen styles and print-size views (4x6, 5x7, 8x10)</li><li>Export selects, roll notes and recent rolls</li><li>Sync Data button; ratings and tags sync to RapidRAW and XMP</li><li>Larger loupe that opens beside the frame</li></ul></description>
     </release>
