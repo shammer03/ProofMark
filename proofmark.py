@@ -6,7 +6,7 @@ ProofMark — darkroom contact-sheet proofing with wax grease-pencil marks.
 
 Target : Fedora Linux (Wayland / X11)
 Stack  : Python 3, PySide6 (Qt 6), Pillow, rawpy (optional, for RAW files)
-Extras : exiftool (system binary, optional) for embedding EXIF/IPTC values
+Extras : exiftool (optional) to read RAW EXIF when seeding RapidRAW sidecars; originals are never written
 
 Module order (top-down execution safety):
   1. Data models, emulsion presets, equipment config, grease shader
@@ -410,7 +410,7 @@ class Frame:
 
     @property
     def sidecar(self) -> Path:
-        return self.path.with_name(self.path.name + ".rrdata")
+        return pm_sidecar_path(self.path)
 
 
 class Roll:
@@ -427,12 +427,17 @@ class Roll:
 
     def load_sidecar_marks(self) -> None:
         for fr in self.frames:
-            try:
-                if fr.sidecar.exists():
-                    data = json.loads(fr.sidecar.read_text(encoding="utf-8"))
-                    fr.marks = [Mark.from_dict(m) for m in data.get("marks", [])]
-            except (OSError, ValueError, KeyError, TypeError):
-                continue
+            # ProofMark <= 1.1.1 kept its marks in <image>.rrdata, the file RapidRAW owns;
+            # read them from there until the next sync moves them into <image>.pmdata.
+            for path in (fr.sidecar, rr_sidecar_path(fr.path)):
+                try:
+                    if path.exists():
+                        data = json.loads(path.read_text(encoding="utf-8"))
+                        if isinstance(data, dict) and "marks" in data:
+                            fr.marks = [Mark.from_dict(m) for m in data["marks"]]
+                            break
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
 
     def apply_marks(self, table: dict[str, list[dict[str, Any]]]) -> None:
         for fr in self.frames:
@@ -453,11 +458,132 @@ def atomic_write_json(path: Path, data: Any) -> None:
     os.replace(tmp, path)
 
 
+# ── Non-destructive metadata: originals are never written to ────────────────
+# ProofMark keeps its own data in <image>.pmdata. Artist, copyright and film / gear notes go into
+# the "exif" map of RapidRAW's <image>.rrdata sidecar, which RapidRAW applies when it exports.
+
+def pm_sidecar_path(image: Path) -> Path:
+    return image.with_name(image.name + ".pmdata")
+
+
+def rr_sidecar_path(image: Path) -> Path:
+    return image.with_name(image.name + ".rrdata")
+
+
+# EXIF tag id -> key RapidRAW uses in its "exif" map (kamadak-exif tag names).
+RR_EXIF_KEYS = {
+    0x010E: "ImageDescription", 0x010F: "Make", 0x0110: "Model", 0x0131: "Software", 0x0132: "DateTime",
+    0x013B: "Artist", 0x8298: "Copyright", 0x829A: "ExposureTime", 0x829D: "FNumber",
+    0x8827: "PhotographicSensitivity", 0x9003: "DateTimeOriginal", 0x9004: "DateTimeDigitized",
+    0x9204: "ExposureBiasValue", 0x920A: "FocalLength", 0xA405: "FocalLengthIn35mmFilm",
+    0xA433: "LensMake", 0xA434: "LensModel",
+}
+# exiftool names (used for RAW files) that differ from RapidRAW's
+_EXIFTOOL_RENAMES = {"ISO": "PhotographicSensitivity", "ExposureCompensation": "ExposureBiasValue",
+                     "ModifyDate": "DateTime", "CreateDate": "DateTimeDigitized"}
+
+
+def _rr_format(key: str, value: Any) -> str:
+    """Format a value the way RapidRAW displays it (e.g. "1/125 s", "f/2.8", "50 mm")."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    if isinstance(value, tuple):
+        value = value[0] if value else ""
+    if isinstance(value, str):
+        return value.replace("\x00", "").strip()  # dates stay "YYYY:MM:DD hh:mm:ss", as RapidRAW stores them
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if key == "ExposureTime":
+        return f"1/{round(1 / num)} s" if 0 < num < 1 else f"{num:g} s"
+    if key == "FNumber":
+        return f"f/{num:g}"
+    if key == "FocalLength":
+        return f"{num:g} mm"
+    return f"{num:g}"
+
+
+def read_rr_exif(image: Path) -> Optional[dict[str, str]]:
+    """The image's own EXIF keyed like RapidRAW's map. {} = no EXIF; None = couldn't be read."""
+    out: dict[str, str] = {}
+    try:
+        if image.suffix.lower() in RAW_EXTS:
+            tool = shutil.which("exiftool")
+            if not tool:
+                return None
+            res = subprocess.run([tool, "-j", "-n", "-EXIF:all", str(image)],
+                                 capture_output=True, text=True, timeout=30, check=False)
+            if res.returncode != 0:
+                return None
+            rows = json.loads(res.stdout or "[]")
+            wanted = set(RR_EXIF_KEYS.values())
+            for name, value in (rows[0] if rows else {}).items():
+                key = _EXIFTOOL_RENAMES.get(name, name)
+                if key in wanted:
+                    out[key] = _rr_format(key, value)
+            if not out:
+                return None  # every real RAW file has EXIF: exiftool couldn't read this one
+        else:
+            with Image.open(image) as img:
+                exif = img.getexif()
+                tags = dict(exif)
+                tags.update(exif.get_ifd(0x8769))
+            for tag, key in RR_EXIF_KEYS.items():
+                if tag in tags:
+                    out[key] = _rr_format(key, tags[tag])
+    except (OSError, ValueError, subprocess.SubprocessError, IndexError):
+        return None
+    return {k: v for k, v in out.items() if v}
+
+
+def merge_rapidraw_exif(image: Path, values: dict[str, str], owned: dict[str, str]) -> Optional[dict[str, str]]:
+    """
+    Put `values` into the "exif" map of RapidRAW's sidecar, keeping everything else in the file.
+    A field is only (over)written when it is empty or still holds what ProofMark wrote last time
+    (`owned`), so edits made in RapidRAW win. Returns the fields ProofMark now owns, or None when
+    the sidecar was left alone (unreadable, or the image's EXIF couldn't be read to seed it).
+    """
+    path = rr_sidecar_path(image)
+    data: dict[str, Any] = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None  # never overwrite a sidecar we can't parse
+        if not isinstance(data, dict):
+            return None
+        if "marks" in data and "adjustments" not in data:
+            data = {}  # written by ProofMark <= 1.1.1; its marks now live in .pmdata
+    before = json.dumps(data, sort_keys=True)
+    exif = data.get("exif")
+    if not isinstance(exif, dict):
+        # RapidRAW shows this map instead of the file's EXIF once it exists, so start from the file's.
+        exif = read_rr_exif(image)
+        if exif is None:
+            return None
+    new_owned: dict[str, str] = {}
+    for key, value in values.items():
+        current = str(exif.get(key, "")).replace('"', "").strip()
+        if value and (not current or current == "..." or current.startswith("0x") or current == owned.get(key)):
+            exif[key] = value
+            new_owned[key] = value
+    if not new_owned and not path.exists():
+        return new_owned  # nothing to hand over: don't create a sidecar just for the file's own EXIF
+    data.setdefault("version", 1)
+    data.setdefault("rating", 0)
+    data.setdefault("adjustments", None)
+    data["exif"] = exif
+    if json.dumps(data, sort_keys=True) != before:
+        atomic_write_json(path, data)
+    return new_owned
+
+
 DEFAULT_SETTINGS: dict[str, Any] = {
     "font_family": "", "font_size": 10, "ui_scale": 100, "accent": "#FFA726",
     "menu_mode": "top", "toolbar_area": "top", "rebate_scale": 100,
     "default_columns": 6, "hover_loupe": True,
-    "autosave_secs": 4, "sync_enabled": True, "embed_exif": True,
+    "autosave_secs": 4, "sync_enabled": True, "rapidraw_exif": True,
     "print_direct": False, "print_ink_saver": False, "print_header": True,
     "auto_update_check": True, "update_repo": "",
 }
@@ -1539,7 +1665,7 @@ class AboutDialog(QDialog):
             "click to place, click-drag to size, in four wax colours</li>"
             "<li>Hover loupe with magnification, and 2-up compare</li>"
             "<li>Equipment inventory: films, camera bodies and lenses with favorites and mounts</li>"
-            "<li>Background sync of <code>.rrdata</code> and <code>.xmp</code> sidecars plus EXIF (via exiftool)</li>"
+            "<li>Non-destructive: marks live in <code>.pmdata</code> / <code>.xmp</code> sidecars, and artist, copyright and gear go into RapidRAW's <code>.rrdata</code>. Your original files are never modified</li>"
             "<li>Automatic session recovery</li></ul>"
             "<p style='color:#888;'>Built with Python, Qt 6 (PySide6), Pillow and rawpy.<br>"
             f"Settings: <code>{CONFIG_DIR}</code></p>")
@@ -1644,13 +1770,14 @@ class SettingsDialog(QDialog):
         fs = QWidget()
         ff = QFormLayout(fs)
         self.autosave = self._spin(2, 60, int(s("autosave_secs")), " s")
-        self.sync_enabled = QCheckBox("Write .rrdata / .xmp sidecars automatically")
+        self.sync_enabled = QCheckBox("Write .pmdata / .xmp sidecars automatically")
         self.sync_enabled.setChecked(bool(s("sync_enabled")))
-        self.embed_exif = QCheckBox("Embed artist / copyright / camera / lens / ISO via exiftool (never touches RAW files)")
-        self.embed_exif.setChecked(bool(s("embed_exif")))
+        self.rapidraw_exif = QCheckBox("Add artist, copyright and film / camera / lens to RapidRAW's .rrdata sidecar\n"
+                                       "(applied when RapidRAW exports; your original files are never modified)")
+        self.rapidraw_exif.setChecked(bool(s("rapidraw_exif")))
         ff.addRow("Session autosave every", self.autosave)
         ff.addRow(self.sync_enabled)
-        ff.addRow(self.embed_exif)
+        ff.addRow(self.rapidraw_exif)
         tabs.addTab(fs, "Files && Sync")
 
         # ── Printing ──
@@ -1727,7 +1854,7 @@ class SettingsDialog(QDialog):
             "menu_mode": self.menu_mode.currentData(), "toolbar_area": self.tb_area.currentData(),
             "rebate_scale": self.rebate.value(), "default_columns": self.cols.value(),
             "hover_loupe": self.hover_loupe.isChecked(), "autosave_secs": self.autosave.value(),
-            "sync_enabled": self.sync_enabled.isChecked(), "embed_exif": self.embed_exif.isChecked(),
+            "sync_enabled": self.sync_enabled.isChecked(), "rapidraw_exif": self.rapidraw_exif.isChecked(),
             "print_direct": self.print_direct.isChecked(), "print_ink_saver": self.ink_saver.isChecked(),
             "print_header": self.print_header.isChecked(), "auto_update_check": self.auto_update.isChecked(),
             "update_repo": self.repo.text().strip()}
@@ -1890,7 +2017,7 @@ class SyncJob:
 
 
 class RapidSyncWorker(QThread):
-    """Writes .rrdata + .xmp sidecars and embeds EXIF via exiftool, off the UI thread."""
+    """Writes .pmdata / .xmp sidecars and RapidRAW .rrdata metadata off the UI thread. Never touches originals."""
 
     status = Signal(str)
 
@@ -1898,8 +2025,7 @@ class RapidSyncWorker(QThread):
         super().__init__(parent)
         self._queue: "queue.Queue[Optional[SyncJob]]" = queue.Queue()
         self._running = True
-        self.exiftool = shutil.which("exiftool")
-        self.embed_exif = True
+        self.rapidraw_exif = True
 
     def submit(self, job: SyncJob) -> None:
         self._queue.put(job)
@@ -1929,39 +2055,41 @@ class RapidSyncWorker(QThread):
             msg = f"Synced {len(batch)} frame(s)"
             if errors:
                 msg += f" — {errors} with warnings"
-            if not self.exiftool:
-                msg += " (exiftool not found: EXIF embedding skipped)"
             self.status.emit(msg)
 
     def _process(self, job: SyncJob) -> bool:
         ok = True
+        sidecar = pm_sidecar_path(job.path)
+        owned: dict[str, str] = {}
         try:
-            sidecar = job.path.with_name(job.path.name + ".rrdata")
+            old = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else {}
+            owned = dict(old.get("rapidraw_exif") or {}) if isinstance(old, dict) else {}
+        except (OSError, ValueError, TypeError):
+            pass
+        if self.rapidraw_exif:
+            gear = [f"Film: {job.film} (ISO {job.iso})" if job.film else "",
+                    f"Camera: {job.camera}" if job.camera else "", f"Lens: {job.lens}" if job.lens else ""]
+            values = {"Artist": job.artist, "Copyright": job.copyright,
+                      "UserComment": "  ·  ".join(g for g in gear if g)}
+            try:
+                result = merge_rapidraw_exif(job.path, values, owned)
+            except OSError:
+                result = None
+            if result is None:
+                ok = False
+            else:
+                owned = result
+        try:
             atomic_write_json(sidecar, {
                 "version": 1, "file": job.path.name, "rating": job.rating, "marks": job.marks,
                 "film": job.film, "iso": job.iso, "camera": job.camera, "lens": job.lens,
-                "artist": job.artist, "copyright": job.copyright})
-            job.path.with_suffix(".xmp").write_text(self._xmp(job), encoding="utf-8")
+                "artist": job.artist, "copyright": job.copyright, "rapidraw_exif": owned})
+            xmp = job.path.with_suffix(".xmp")
+            # Same file name RapidRAW and Lightroom use: only replace an .xmp that ProofMark wrote itself.
+            if not xmp.exists() or "ns.proofmark.app" in xmp.read_text(encoding="utf-8", errors="replace"):
+                xmp.write_text(self._xmp(job), encoding="utf-8")
         except OSError:
             ok = False
-        # Never modify RAW originals; their metadata travels in the .xmp sidecar.
-        if self.exiftool and self.embed_exif and job.path.suffix.lower() not in RAW_EXTS:
-            cmd = [self.exiftool, "-overwrite_original", "-q", "-m"]
-            if job.artist:
-                cmd.append(f"-Artist={job.artist}")
-            if job.copyright:
-                cmd.append(f"-Copyright={job.copyright}")
-            if job.camera:
-                cmd.append(f"-Model={job.camera}")
-            if job.lens:
-                cmd.append(f"-LensModel={job.lens}")
-            cmd.append(f"-ISO={job.iso}")
-            cmd.append(str(job.path))
-            try:
-                res = subprocess.run(cmd, capture_output=True, timeout=45, check=False)
-                ok = ok and res.returncode == 0
-            except (OSError, subprocess.SubprocessError):
-                ok = False
         return ok
 
     @staticmethod
@@ -3506,7 +3634,7 @@ class MainWindow(QMainWindow):
         app.setStyleSheet(build_style(family, size, ACCENT_HEX))
         self._apply_layout_prefs()
         self.autosave.setInterval(max(2, int(c.setting("autosave_secs"))) * 1000)
-        self.sync_worker.embed_exif = bool(c.setting("embed_exif"))
+        self.sync_worker.rapidraw_exif = bool(c.setting("rapidraw_exif"))
         for page in self.pages():
             page.canvas.viewport().update()
 
