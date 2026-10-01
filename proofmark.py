@@ -2678,6 +2678,29 @@ def _draw_glyph(kind: str, p: QPainter, s: float) -> None:
         p.setBrush(p.pen().color())
         p.drawEllipse(QPointF(s * 0.28, s * 0.62), s * 0.1, s * 0.1)
         p.drawEllipse(QPointF(s * 0.66, s * 0.5), s * 0.22, s * 0.22)
+    elif kind in ("rotate-left", "rotate-right"):  # a film negative with a turning arrow around it
+        fw, fh = s * 0.40, s * 0.30
+        frame = QRectF(s / 2 - fw / 2, s / 2 - fh / 2, fw, fh)
+        p.drawRect(frame)
+        hole = max(1.0, s * 0.04)
+        for k in range(3):  # sprocket holes along the top and bottom edge
+            x = frame.left() + fw * (0.2 + 0.3 * k)
+            for y in (frame.top() + hole * 1.6, frame.bottom() - hole * 1.6):
+                p.drawPoint(QPointF(x, y))
+        r = s * 0.40
+        box = QRectF(s / 2 - r, s / 2 - r, 2 * r, 2 * r)
+        cw = kind == "rotate-right"
+        start, span = (120, -250) if cw else (60, 250)  # degrees, Qt counts anticlockwise from 3 o'clock
+        p.drawArc(box, int(start * 16), int(span * 16))
+        end = math.radians(start + span)
+        tip = QPointF(s / 2 + r * math.cos(end), s / 2 - r * math.sin(end))
+        # arrowhead pointing along the direction of travel
+        d = -1 if cw else 1
+        tx, ty = -math.sin(end) * d, -math.cos(end) * d
+        a = s * 0.16
+        for ang in (0.5, -0.5):
+            ca, sa = math.cos(ang), math.sin(ang)
+            p.drawLine(tip, QPointF(tip.x() - a * (tx * ca - ty * sa), tip.y() - a * (tx * sa + ty * ca)))
     elif kind == "filter":  # a funnel
         p.drawPolygon([QPointF(m, m * 1.2), QPointF(s - m, m * 1.2), QPointF(s * 0.58, s * 0.55),
                        QPointF(s * 0.58, s - m), QPointF(s * 0.42, s - m * 1.6), QPointF(s * 0.42, s * 0.55)])
@@ -3665,6 +3688,10 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._overlay: Optional["LoupeOverlay"] = None  # draws the 60% / 95% views over the whole window
         self._move_drag: Optional[dict[str, int]] = None  # Ctrl+drag of a frame to a new place
         self._before_click: Optional[tuple] = None  # view before the last click (a double-click restores it)
+        self._pending_click: Optional[dict[str, Any]] = None  # Mark-mode click waiting out the double-click time
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self._pending_zoom)
         self.show_hist = self.show_clip = self.show_peak = False  # exposure tools in the loupe
         self._expo: "OrderedDict[tuple, dict[str, Any]]" = OrderedDict()
         self._press: Optional[dict[str, Any]] = None  # a press waiting to be a click (zoom) or a drag (draw)
@@ -4554,6 +4581,11 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._press = {"idx": idx, "pos": QPointF(pos)}
         self.viewport().update()
 
+    def _pending_zoom(self) -> None:
+        press, self._pending_click = self._pending_click, None
+        if press is not None:
+            self._toggle_zoom(press)
+
     def _toggle_zoom(self, press: dict[str, Any]) -> None:
         """A click: switch between the 60% view and the 95% enlarged view (same in both modes)."""
         self._before_click = (self.loupe_locked, self.locked_index, self.mag, self.focus)  # for a double-click
@@ -4663,7 +4695,13 @@ class ContactSheetCanvas(QAbstractScrollArea):
             return
         if e.button() == Qt.LeftButton and self._press is not None:
             press, self._press = self._press, None
-            self._toggle_zoom(press)
+            if self.tool in POINT_TOOLS or self.tool in DRAG_TOOLS:
+                # Mark mode: a double-click removes a mark, so wait out the double-click time before
+                # zooming; otherwise the photo would flash to 95% and back on every double-click.
+                self._pending_click = press
+                self._click_timer.start(QApplication.doubleClickInterval())
+            else:
+                self._toggle_zoom(press)  # Loupe mode: nothing else a click could mean
         if e.button() in (Qt.RightButton, Qt.LeftButton) and self._pan_last is not None:
             self._pan_last = None
             self._update_cursor(e.position())
@@ -4705,9 +4743,12 @@ class ContactSheetCanvas(QAbstractScrollArea):
         e.accept()
         if e.button() != Qt.LeftButton or self.compare or self.tool in (T_INSPECT, T_ADJUST):
             return
-        if self._before_click is not None:
+        if self._click_timer.isActive():  # the first click hasn't zoomed yet: it never will
+            self._click_timer.stop()
+            self._pending_click = None
+        elif self._before_click is not None:
             self.loupe_locked, self.locked_index, self.mag, self.focus = self._before_click
-            self._before_click = None
+        self._before_click = None
         pos = e.position()
         target = self._target_at(pos)
         idx = target[0] if target else self.cell_at(pos)
@@ -5327,7 +5368,7 @@ class MainWindow(QMainWindow):
         for text, steps, tip in (("Rotate left", -1, "Rotate the frame counter-clockwise  (Ctrl+[)"),
                                  ("Rotate right", 1, "Rotate the frame clockwise  (Ctrl+])")):
             act = QAction(text, self)
-            ic = tool_icon("adw:object-rotate-left" if steps < 0 else "adw:object-rotate-right")
+            ic = tool_icon("tool:rotate-left" if steps < 0 else "tool:rotate-right")
             if ic is not None:
                 act.setIcon(ic)
             act.setToolTip(tip + "\nActs on the enlarged frame, or the last one you clicked. Display only.")
