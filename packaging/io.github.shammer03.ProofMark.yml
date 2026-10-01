@@ -23,7 +23,6 @@ modules:
       - pip3 install --prefix=/app --no-deps --no-build-isolation Pillow*.whl
     sources:
       - type: file
-        # TODO: pin the real Pillow wheel URL + sha256 (use flatpak-pip-generator)
         url: https://files.pythonhosted.org/packages/REPLACE/Pillow.whl
         sha256: REPLACE
   - name: exiftool
@@ -32,7 +31,6 @@ modules:
       - perl Makefile.PL && make install DESTDIR=/ PREFIX=/app
     sources:
       - type: archive
-        # TODO: pin a current Image-ExifTool release + sha256
         url: https://exiftool.org/Image-ExifTool-REPLACE.tar.gz
         sha256: REPLACE
   - name: proofmark

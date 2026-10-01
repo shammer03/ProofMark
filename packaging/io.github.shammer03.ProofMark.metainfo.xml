@@ -23,7 +23,6 @@
   <provides><binary>proofmark</binary></provides>
   <url type="homepage">https://github.com/shammer03/ProofMark</url>
   <url type="bugtracker">https://github.com/shammer03/ProofMark/issues</url>
-  <!-- TODO: add at least one <screenshot> (required by Flathub) -->
   <releases>
     <release version="1.2.1" date="2026-10-01">
       <description><ul><li>Loupe and Mark modes with the same viewing controls</li><li>Wheel grows the loupe to 95%, then zooms the photo to 200%</li><li>Click zooms; drag draws (Mark) or moves the photo (Loupe)</li><li>Sync modes: auto, on close or manual</li><li>Line stabiliser and rebalanced brush sizes</li><li>Undo / redo and rotate buttons; full lens names</li><li>Fixes: font setting, quitting with a window open</li></ul></description>

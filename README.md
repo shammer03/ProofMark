@@ -26,13 +26,4 @@ exiftool is optional: it is only used to read RAW files' EXIF the first time a `
 
 Set `UPDATE_REPO = "owner/repo"` in proofmark.py (or Settings ▸ Updates) to enable in-app update checks.
 
-## Getting into Fedora / Flathub
-1. **Now:** publish on GitHub, then create a **COPR** repo from `packaging/proofmark.spec`.
-   Users run `sudo dnf copr enable you/proofmark && sudo dnf install proofmark`.
-2. **Flathub:** finish `packaging/io.github.shammer03.ProofMark.yml` (pin wheel/exiftool hashes),
-   add screenshots + homepage URL to the metainfo, then open a submission at github.com/flathub/flathub.
-   Flatpak apps appear in GNOME Software, which is what most people mean by the "Fedora app store".
-3. **Official Fedora repos:** submit the RPM for package review once it is stable.
-
-Licence: GPL-3.0-or-later, © 2026 S. Hambrick (see `LICENSE`). Still to do before Flathub: add a screenshot
-to the metainfo and pin the Pillow / exiftool hashes in the Flatpak manifest.
+Licence: GPL-3.0-or-later, © 2026 S. Hambrick (see `LICENSE`).
