@@ -75,8 +75,8 @@ Image.MAX_IMAGE_PIXELS = None
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME = "ProofMark"
-APP_VERSION = "1.3.0"
-BUILD_NUMBER = 10
+APP_VERSION = "1.3.1"
+BUILD_NUMBER = 11
 BUILD_DATE = "2026-10-01"
 RELEASE_CHANNEL = "stable"
 APP_ID = "io.github.shammer03.ProofMark"  # reverse-DNS id used by Flatpak / AppStream; change to your own
@@ -86,6 +86,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Newest first. `release.py bump` inserts new entries at the marker.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
     # <changelog-insert>
+    ("1.3.1", "2026-10-01", [
+        'Toolbar icons with hover descriptions',
+        'Double-click removes a mark again in Mark mode',
+        'Save Ink When Printing in the File menu',
+        'Vertical frames lie sideways on printed sheets by default']),
     ("1.3.0", "2026-10-01", [
         'Export sheets as JPEG, TIFF or PNG',
         'Choose an export folder; PDF and images go there',
