@@ -4149,8 +4149,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
             else:
                 over_view = self._on_view(pos)
         loupe_showing = self.loupe_locked or (self.loupe_enabled and self.hover_index >= 0)
-        if self.tool == T_INSPECT and loupe_showing and not self.compare:
-            over_view = True  # Loupe mode: the wheel always zooms the loupe, enlarged or not
+        if loupe_showing and not self.compare:
+            over_view = True  # both modes alike: while a loupe is showing, the wheel zooms it
         if e.modifiers() & Qt.ShiftModifier:  # Shift+wheel always scrolls the contact sheet
             d = e.angleDelta()
             delta = d.y() or d.x()  # some systems turn Shift+wheel into a sideways scroll
