@@ -56,7 +56,7 @@ from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, Q
                             QTimer, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontMetrics,
                            QIcon, QImage, QPainter, QPainterPath, QPen,
-                           QPixmap, QPolygonF, QTransform, QRegion, QCursor, QMouseEvent, QWheelEvent)
+                           QPixmap, QTransform, QRegion, QCursor, QMouseEvent, QWheelEvent)
 from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QComboBox,
                                QCompleter, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
@@ -1243,34 +1243,6 @@ def smooth_line(npts: list[list[float]], rect: QRectF) -> list[list[float]]:
         pts = out
     res = [_norm(rect, q.x(), q.y()) for q in pts]
     return res if len(res) >= 3 else res + [list(res[-1])] * (3 - len(res))
-
-
-def _dist_to_rect(pt: QPointF, r: QRectF) -> float:
-    dx = max(r.left() - pt.x(), 0.0, pt.x() - r.right())
-    dy = max(r.top() - pt.y(), 0.0, pt.y() - r.bottom())
-    return math.hypot(dx, dy)
-
-
-def hull_polygon(rects: list[QRectF]) -> QPolygonF:
-    """Convex hull around rectangles (here: a frame and its 60% view, plus the space between them)."""
-    pts = sorted({(round(q.x(), 2), round(q.y(), 2)) for r in rects
-                  for q in (r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft())})
-    if len(pts) < 3:
-        return QPolygonF([QPointF(x, y) for x, y in pts])
-
-    def cross(o, a, b):
-        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-    lower: list = []
-    upper: list = []
-    for pt in pts:
-        while len(lower) >= 2 and cross(lower[-2], lower[-1], pt) <= 0:
-            lower.pop()
-        lower.append(pt)
-    for pt in reversed(pts):
-        while len(upper) >= 2 and cross(upper[-2], upper[-1], pt) <= 0:
-            upper.pop()
-        upper.append(pt)
-    return QPolygonF([QPointF(x, y) for x, y in lower[:-1] + upper[:-1]])
 
 
 def move_mark(mark: Mark, pts0: list[list[float]], dx: float, dy: float) -> None:
@@ -3096,13 +3068,14 @@ class ContactSheetCanvas(QAbstractScrollArea):
     """
     Edge-to-edge contact sheet with rebate bars, grease marks, loupe and 2-up compare.
 
-    Interaction map
-      hover            -> 50% loupe (opposite side of the cursor)
-      click (Inspect)  -> loupe scales to 85%;  right-click / Space also lock it
-      Ctrl+wheel       -> loupe magnification 0.7x .. 4.5x (marks never hidden)
-      right-drag       -> pan a locked, magnified loupe
-      double-click     -> pop topmost mark (frame first, then across frames)
-      Ctrl+Z           -> pop most recent mark anywhere
+    Interaction map (the same in Loupe and Mark mode, except that only Mark mode draws)
+      hover            -> 60% view beside the frame
+      click            -> switch 60% / 95% enlarged view (double-click = click); right-click / Space too
+      wheel            -> while a view shows: grow it to 95%, then magnify the photo to 200%
+      drag (Mark mode) -> draw a mark from the press point
+      right-drag       -> pan a magnified view
+      Delete           -> remove the selected mark, else the newest mark on the photo under the cursor
+      Ctrl+Z / Ctrl+Shift+Z -> undo / redo
       C                -> 2-up compare (A locked, B follows hover); C / Esc exits
     """
 
@@ -3148,21 +3121,14 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._edit: Optional[dict[str, Any]] = None
         self.sel: Optional[tuple[int, Mark]] = None  # selected mark (handles shown)
         self._pan_last: Optional[QPointF] = None
-        self._last_click_added: Optional[tuple[int, Mark]] = None
-        self._click_locked = False
         self.undo_ops: list[tuple] = []   # ("add" | "remove" | "edit" | "frame" | "rotate" | "group", ...)
         self.redo_ops: list[tuple] = []
         self.filter = "all"
         self.order: list[int] = []        # frames shown, in sheet order (the filter decides)
         self._pos: dict[int, int] = {}    # frame index -> position on the sheet
         self._kbd_nav = False             # last frame choice came from the keyboard
-        self._toward_view = False         # cursor came from the hovered frame, may be heading to its view
         self._overlay: Optional["LoupeOverlay"] = None  # draws the 60% / 95% views over the whole window
-        self._press: Optional[dict[str, Any]] = None          # Mark mode press waiting to become a drag
-        self._pending_click: Optional[dict[str, Any]] = None  # click waiting out the double-click time
-        self._click_timer = QTimer(self)
-        self._click_timer.setSingleShot(True)
-        self._click_timer.timeout.connect(self._mark_mode_click)
+        self._press: Optional[dict[str, Any]] = None  # a press waiting to be a click (zoom) or a drag (draw)
         self._pix_cache: "OrderedDict[Path, QPixmap]" = OrderedDict()
 
         self.setFrameShape(QFrame.NoFrame)
@@ -3232,11 +3198,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._edit = {"idx": idx, "mark": mk, "mode": mode, "start": QPointF(pos), "moved": False,
                       "pts": [list(p) for p in mk.pts], "size": mk.size, "bounds": mark_bounds_px(mk, rect)}
 
-    def _on_view(self, pos: QPointF) -> bool:
-        """Mark mode: the cursor came onto the 60% view from its frame, so a click / the wheel is for it."""
-        box = self._hover_box()
-        return box is not None and self.tool != T_INSPECT and self._toward_view and box.contains(pos)
-
     def _hover_box(self) -> Optional[QRectF]:
         """The 60% hover view's box while it is showing, else None."""
         if (self.loupe_locked or self.compare or not self.loupe_enabled or self.hover_index < 0
@@ -3245,9 +3206,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
         return self.loupe_geometry(self.hover_index, False)[0]
 
     def _update_cursor(self, pos: QPointF) -> None:
-        if self._on_view(pos):  # the 60% view: click enlarges, wheel zooms
-            self.viewport().setCursor(Qt.PointingHandCursor)
-            return
         cur = Qt.ArrowCursor
         target = None if self.compare else self._target_at(pos)
         if target and self.tool != T_INSPECT:
@@ -3428,18 +3386,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
         bw, bh = W.width() * frac, W.height() * frac
         if locked:
             box = QRectF(W.center().x() - bw / 2, W.center().y() - bh / 2, bw, bh)
-        elif self.tool != T_INSPECT:
-            # Mark mode: the 60% view sits in the half of the window away from the frame, and stays
-            # when you move onto it (see mouseMoveEvent).
-            cell = self._cell_rect(idx)
-            gap = 16.0
-            if cell.center().x() < W.center().x():  # frame on the left: view on the right, clear of it
-                x = max(cell.right() + gap, W.right() - bw - 16)
-                w = W.right() - 16 - x
-            else:
-                x = W.left() + 16
-                w = min(bw, cell.left() - gap - x)
-            box = fit_rect(QRectF(x, W.center().y() - bh / 2, max(60.0, w), bh), self.frames[idx].aspect)
         else:
             box = self._hover_loupe_box(idx, bw, bh)
         base = fit_rect(box, self.frames[idx].aspect)
@@ -3555,13 +3501,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
             self._record(("remove", idx, mark, pos))
         self.marksChanged.emit(idx)
         self.viewport().update()
-
-    def _retract_add(self, idx: int, mark: Mark) -> None:
-        """Take back a mark placed by accident (first click of a double-click) without an undo step."""
-        self._delete_mark(idx, mark)
-        if self.undo_ops and self.undo_ops[-1][0] == "add" and self.undo_ops[-1][2] is mark:
-            self.undo_ops.pop()
-        self.marksChanged.emit(idx)
 
     def _apply_op(self, op: tuple, undo: bool) -> int:
         kind = op[0]
@@ -3896,7 +3835,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
     def mousePressEvent(self, e) -> None:  # noqa: N802
         self.setFocus()
         pos = e.position()
-        self._click_locked = False
         if e.button() == Qt.RightButton:
             if self.loupe_locked:
                 if self._target_at(pos) is None:
@@ -3918,14 +3856,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 self.selected = i
                 self.viewport().update()
             return
-        if self._on_view(pos):  # click on the 60% view: enlarge to 95%
-            self.mag = LOUPE_FIT
-            self.loupe_locked = True
-            self.locked_index = self.selected = self.hover_index
-            self._click_locked = True
-            self._last_click_added = None
-            self.viewport().update()
-            return
         target = self._target_at(pos)
         if target is None:
             if self.loupe_locked:
@@ -3934,7 +3864,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
             return
         idx, rect = target
         self.selected = idx
-        self._last_click_added = None
         # 1) handles of the selected mark win in every tool except Inspect
         if self.tool != T_INSPECT and self._sel_valid() and self.sel is not None and self.sel[0] == idx:
             sel_mark = self.sel[1]
@@ -3958,25 +3887,14 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 self._begin_edit(idx, picked, "move", pos, rect)
             self.viewport().update()
             return
-        if self.tool in POINT_TOOLS or self.tool in DRAG_TOOLS:
-            # Only click-and-drag draws. A press waits: moving past the drag distance starts the mark
-            # at the press point; letting go without moving is a click, which zooms (60% <-> 95%).
-            self.sel = None
-            self._press = {"idx": idx, "pos": QPointF(pos)}
-        else:  # Loupe mode: a click switches between the 60% hover view and the 95% enlarged view
-            self._last_click_added = None
-            if self.loupe_locked:
-                self.loupe_locked = False
-            else:
-                self._lock_loupe(idx, pos)
-                self._click_locked = True
+        # Both modes: a click (press and let go without moving) switches 60% <-> 95%.
+        # In Mark mode, moving past the drag distance instead draws a mark from the press point.
+        self.sel = None
+        self._press = {"idx": idx, "pos": QPointF(pos)}
         self.viewport().update()
 
-    def _mark_mode_click(self) -> None:
-        """A Mark-mode click (no drag, no double-click): switch 60% <-> 95%, like Loupe mode."""
-        press, self._pending_click = self._pending_click, None
-        if press is None:
-            return
+    def _toggle_zoom(self, press: dict[str, Any]) -> None:
+        """A click: switch between the 60% view and the 95% enlarged view (same in both modes)."""
         if self.loupe_locked:
             self.loupe_locked = False
         elif 0 <= press["idx"] < len(self.frames):
@@ -3995,7 +3913,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
         pos = e.position()
         if (pos - self.hover_pos).manhattanLength() > 2:
             self._kbd_nav = False
-        prev = QPointF(self.hover_pos)
         self.hover_pos = QPointF(pos)
         if self._pan_last is not None and self.loupe_locked:
             _box, img = self.loupe_geometry(self.locked_index, True)
@@ -4013,11 +3930,14 @@ class ContactSheetCanvas(QAbstractScrollArea):
             else:
                 resize_mark(mk, rect, ed["mode"], pos, ed)
             ed["moved"] = True
-        elif self._press is not None and not self._press.get("adjust"):
+        elif self._press is not None:
             start = self._press["pos"]
             if (pos - start).manhattanLength() >= QApplication.startDragDistance():
                 idx = self._press["idx"]
+                draws = not self._press.get("adjust") and (self.tool in POINT_TOOLS or self.tool in DRAG_TOOLS)
                 self._press = None
+                if not draws:  # Loupe mode (or Adjust on empty space): a drag is not a click
+                    return
                 rect = self._rect_for(idx)
                 is_point = self.tool in POINT_TOOLS
                 n0 = norm_in_rect(rect, start)
@@ -4053,24 +3973,11 @@ class ContactSheetCanvas(QAbstractScrollArea):
             else:
                 mark.pts[1] = n
         elif not self.loupe_locked:
-            box = self._hover_box()
-            cell = self._cell_rect(self.hover_index) if self.hover_index >= 0 else QRectF()
-            heading = box is not None and (box.contains(pos) or _dist_to_rect(pos, box) < _dist_to_rect(prev, box))
-            if (box is not None and self.tool != T_INSPECT and self._toward_view and heading
-                    and not cell.contains(pos) and hull_polygon([cell, box]).containsPoint(pos, Qt.OddEvenFill)):
-                # Travelling from the frame to its 60% view (or resting on it): the view stays put,
-                # like a menu that doesn't close while you move into its submenu. On the view a click
-                # enlarges it, the wheel zooms, and when zoomed in, moving pans.
-                if box.contains(pos):
-                    self.focus = QPointF(min(1.0, max(0.0, (pos.x() - box.x()) / max(1.0, box.width()))),
-                                         min(1.0, max(0.0, (pos.y() - box.y()) / max(1.0, box.height()))))
-            else:
-                i = self.cell_at(pos)
-                self.hover_index = i
-                self._toward_view = i >= 0  # on a frame: you may now head for its view
-                if i >= 0:
-                    n = norm_in_rect(self._image_rect(i), pos)
-                    self.focus = QPointF(n[0], n[1])
+            i = self.cell_at(pos)
+            self.hover_index = i
+            if i >= 0:
+                n = norm_in_rect(self._image_rect(i), pos)
+                self.focus = QPointF(n[0], n[1])
         if self._drag is None and self._edit is None and self._pan_last is None:
             self._update_cursor(pos)
         self.viewport().update()
@@ -4078,9 +3985,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
     def mouseReleaseEvent(self, e) -> None:  # noqa: N802
         if e.button() == Qt.LeftButton and self._press is not None:
             press, self._press = self._press, None
-            # Wait out the double-click interval: a double-click removes a mark and must not also zoom.
-            self._click_timer.start(QApplication.doubleClickInterval())
-            self._pending_click = press
+            self._toggle_zoom(press)
         if e.button() == Qt.RightButton:
             self._pan_last = None
         if e.button() == Qt.LeftButton and self._edit is not None:
@@ -4107,38 +4012,15 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 valid = diag > 6.0  # only a real drag draws
             if valid:
                 self._add_mark(idx, mark)
-                self._last_click_added = (idx, mark)
                 if mark.kind not in POINT_TOOLS:  # boxes / arrows / lines stay selected so they can be tweaked
                     self.sel = (idx, mark)
                     self.status.emit("Drag the handles to resize  •  E = Adjust tool to move  •  Del removes  •  Esc deselects")
         self.viewport().update()
 
     def mouseDoubleClickEvent(self, e) -> None:  # noqa: N802
-        if e.button() != Qt.LeftButton or self.compare:
-            return
-        pos = e.position()
-        target = self._target_at(pos)
-        idx = target[0] if target else self.cell_at(pos)
-        # The first click of the double-click already placed a mark / locked the loupe: undo those.
-        if self._last_click_added is not None:
-            fi, mk = self._last_click_added
-            if any(m is mk for m in self.frames[fi].marks):
-                self._retract_add(fi, mk)
-            self._last_click_added = None
-        self._click_timer.stop()  # this was a double-click, not a click
-        self._pending_click = None
-        if self._click_locked or self.tool == T_INSPECT:
-            # The first click already switched the view (Loupe mode, or the 60% view): nothing more.
-            self._click_locked = False
-            self.viewport().update()
-            return
-        # Mark mode: take back this photo's newest mark; each further double-click takes the one before.
-        # Only marks on this photo, and never anything already deleted.
-        if 0 <= idx < len(self.frames) and self.frames[idx].marks:
-            self._remove_mark(idx, self.frames[idx].marks[-1])
-            left = len(self.frames[idx].marks)
-            self.status.emit(f"Frame {idx + 1}A: newest mark removed  ({left} left; Ctrl+Z brings it back)")
-        self.viewport().update()
+        # Same in both modes: a double-click is just a click (the first click already zoomed),
+        # so double-clicking a photo enlarges it. It never adds or removes marks.
+        e.accept()
 
     def wheelEvent(self, e) -> None:  # noqa: N802
         pos = e.position()
@@ -4146,8 +4028,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
         if not self.compare:
             if self.loupe_locked:
                 over_view = self.loupe_geometry(self.locked_index, True)[0].contains(pos)
-            else:
-                over_view = self._on_view(pos)
         loupe_showing = self.loupe_locked or (self.loupe_enabled and self.hover_index >= 0)
         if loupe_showing and not self.compare:
             over_view = True  # both modes alike: while a loupe is showing, the wheel zooms it
@@ -4225,6 +4105,13 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 self.marksChanged.emit(fi)
                 self.viewport().update()
                 return
+        if key in (Qt.Key_Delete, Qt.Key_Backspace):  # no mark selected: the photo's newest mark
+            idx = self._target_frame()
+            if idx >= 0 and self.frames[idx].marks:
+                self._remove_mark(idx, self.frames[idx].marks[-1])
+                self.status.emit(f"Frame {idx + 1}A: newest mark removed  "
+                                 f"({len(self.frames[idx].marks)} left; Ctrl+Z brings it back)")
+            return
         if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Home, Qt.Key_End):
             self._navigate(key)
             return
@@ -4482,21 +4369,21 @@ KEYS_TEXT = (
     "Click places at the brush size.  Click-drag draws every mark from the corner you press\n"
     "towards the cursor, like a box.  Box, arrow and line stay selected so you can drag\n"
     "their handles.  Adjust tool: click a mark, drag to move, drag handles to resize.\n"
-    "Delete removes the selected mark, arrow keys nudge it (Shift = bigger steps), Esc deselects.\n\n"
+    "Arrow keys nudge a selected mark (Shift = bigger steps), Esc deselects.\n\n"
     "BRUSH\n[ / ]  Smaller / larger     Alt+1-4  Red / Toxic green / Silver / Yellow\n"
     "Pen menu: wax pencil, china marker, felt marker or standard line\n\n"
     "CULLING  (acts on the frame under the mouse, or the highlighted one after arrow keys)\n"
     "Arrow keys / Home / End  Move between frames     1-5  Rate     0  Clear rating\n"
     "Shift+X  Reject / un-reject     N  Frame note     Ctrl+] / Ctrl+[  Rotate     Space  Enlarge\n"
     "Star colours rate too: green 5, red 5, yellow 4, silver 3 (Settings ▸ Files & Sync)\n\n"
-    "VIEWING\n"
-    "Hover  60% view beside the frame — move onto it to keep it: click = 95%, wheel = zoom\n"
-    "Loupe mode: click switches 60% / 95%     Right-click / Space  Enlarge     Esc  Back\n"
+    "VIEWING  (the same in Loupe and Mark mode)\n"
+    "Hover  60% view beside the frame     Click (or double-click)  60% / 95%     Esc  Back\n"
+    "Wheel  Grow the view to 95%, then magnify the photo to 200% (stops at 75 / 95 / 150 / 200%)\n"
+    "Shift+Wheel  Scroll the sheet     Right-drag  Pan     Ctrl+0  Back to 95%\n"
     "View  Full screen, or the sheet as it prints on 4×6, 5×7 or 8×10     Show  filter frames\n"
-    "Ctrl+Wheel  Zoom 0.7×–4.5×     Right-drag  Pan     Ctrl+0  Reset zoom\n"
     "C  2-up compare (hover for [B]); C or Esc exits\n\n"
-    "UNDO\nCtrl+Z  Undo     Ctrl+Shift+Z  Redo     Delete  Remove the selected mark\n"
-    "Mark mode: double-click a photo  Remove its newest mark (again for the one before)\n\n"
+    "UNDO\nCtrl+Z / ↶ Undo     Ctrl+Shift+Z / ↷ Redo\n"
+    "Delete  Remove the selected mark, or the newest mark on the photo under the cursor\n\n"
     "FILE\nCtrl+O Import   Ctrl+P Print   Ctrl+Shift+E PDF   Ctrl+Shift+S Export selects   Ctrl+S Sync Data\n"
     "Ctrl+, Settings   F11 Full screen")
 
