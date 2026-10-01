@@ -25,6 +25,7 @@ import queue
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import zlib
@@ -76,7 +77,7 @@ BUILD_NUMBER = 5
 BUILD_DATE = "2026-09-30"
 RELEASE_CHANNEL = "stable"
 APP_ID = "io.github.shammer03.ProofMark"  # reverse-DNS id used by Flatpak / AppStream; change to your own
-UPDATE_REPO = "shammer03/proofmark"  # GitHub "owner/repo" that publishes releases (or set it in Settings ▸ Updates)
+UPDATE_REPO = "shammer03/ProofMark"  # GitHub "owner/repo" that publishes releases (or set it in Settings ▸ Updates)
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 # Newest first. `release.py bump` inserts new entries at the marker.
@@ -148,7 +149,7 @@ def install_kind() -> str:
 DEV_INFO = {
     "name": "S. Hambrick",
     "role": "Photographer & developer",
-    "website": "https://github.com/shammer03/proofmark",
+    "website": "https://github.com/shammer03/ProofMark",
     "email": "",
     "bio": "",
 }
@@ -385,6 +386,7 @@ class Frame:
         self.preview: Optional[QImage] = None
         self.aspect: float = THUMB_W / THUMB_H
         self.marks: list[Mark] = []
+        self.error: str = ""  # set when the file could not be decoded
 
     @property
     def rejected(self) -> bool:
@@ -942,7 +944,39 @@ QToolBar QLabel { background: transparent; color: #dddddd; padding: 0 4px; }
 QSlider::groove:horizontal { height: 5px; background: #333; border-radius: 2px; }
 QSlider::sub-page:horizontal { background: #FFA726; border-radius: 2px; }
 QSlider::handle:horizontal { background: #FFA726; width: 18px; height: 18px; margin: -7px 0; border-radius: 9px; }
+QSpinBox { padding-right: 18px; }
+QSpinBox::up-button, QSpinBox::down-button { subcontrol-origin: border; width: 16px; background: #222222; border-left: 1px solid #333; }
+QSpinBox::up-button { subcontrol-position: top right; }
+QSpinBox::down-button { subcontrol-position: bottom right; }
+QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #3a3a3a; }
+QSpinBox::up-arrow { image: url("@ARROW_DIR@/up.png"); width: 8px; height: 8px; }
+QSpinBox::down-arrow { image: url("@ARROW_DIR@/down.png"); width: 8px; height: 8px; }
 """
+
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "proofmark"
+
+
+def _spin_arrow_dir() -> str:
+    """Light arrow images for spin boxes (the dark stylesheet hides Qt's own arrows)."""
+    out = CACHE_DIR / "ui"
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        for name, tip_y, base_y in (("up", 2.0, 8.0), ("down", 8.0, 2.0)):
+            target = out / f"{name}.png"
+            if target.exists():
+                continue
+            img = QImage(10, 10, QImage.Format_ARGB32)
+            img.fill(Qt.transparent)
+            p = QPainter(img)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#DDDDDD"))
+            p.drawPolygon([QPointF(5, tip_y), QPointF(9, base_y), QPointF(1, base_y)])
+            p.end()
+            img.save(str(target), "PNG")
+    except OSError:
+        pass
+    return out.as_posix()
 
 _STYLE_FONT_RULE = '* { font-family: "Inter", "Cantarell", "DejaVu Sans", sans-serif; }'
 
@@ -952,7 +986,7 @@ def build_style(family: str, size: int, accent: str) -> str:
     fam = f'"{family}", ' if family else ""
     css = STYLE.replace(_STYLE_FONT_RULE, '* { font-family: ' + fam +
                         '"Inter", "Cantarell", "DejaVu Sans", sans-serif; font-size: ' + str(size) + 'pt; }')
-    return css.replace("#FFA726", accent)
+    return css.replace("#FFA726", accent).replace("@ARROW_DIR@", _spin_arrow_dir())
 
 # ════════════════════════════════════════════════════════════════════════════
 # 2. DIALOGS & CUSTOM WIDGETS
@@ -2093,7 +2127,9 @@ def render_contact_sheet(printer: Any, roll: Roll, columns: int, meta: dict[str,
     if not p.begin(printer):
         return 0
     p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
-    rect = QRectF(printer.pageLayout().paintRectPixels(printer.resolution()))
+    # The painter's origin is already the top-left of the printable area (inside the margins).
+    paint = printer.pageLayout().paintRectPixels(printer.resolution())
+    rect = QRectF(0, 0, paint.width(), paint.height())
     cols = max(1, columns)
     n = len(roll.frames)
     head_h = rect.height() * 0.045 if header else 0.0
@@ -2502,7 +2538,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
             p.setOpacity(1.0)
         else:
             p.setPen(QColor("#555555"))
-            p.drawText(slot, Qt.AlignCenter, "loading…")
+            p.drawText(slot, Qt.AlignCenter, "can't open" if fr.error else "loading…")
         width = max(1.5, img.width() * 0.011)
         for mk in self._marks_with_drag(i):
             draw_mark(p, mk, img, width)
@@ -2539,7 +2575,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
             p.drawPixmap(img, pm, QRectF(pm.rect()))
         else:
             p.setPen(QColor("#666666"))
-            p.drawText(box, Qt.AlignCenter, "loading…")
+            p.drawText(box, Qt.AlignCenter, f"Can't open this file\n{fr.error}" if fr.error else "loading…")
         width = max(1.8, img.width() * 0.008)
         for mk in self._marks_with_drag(idx):
             draw_mark(p, mk, img, width)
@@ -2927,7 +2963,7 @@ class RollPage(QWidget):
 
         self.loader = ImageLoaderThread([f.path for f in self.roll.frames], self)
         self.loader.frameReady.connect(self.canvas.on_frame_ready)
-        self.loader.frameFailed.connect(lambda _i, msg: self.info.setText(f"Load error: {msg}"))
+        self.loader.frameFailed.connect(self._on_frame_failed)
         self.loader.progress.connect(self._on_progress)
         self.loader.start()
         self._update_info(0, len(self.roll.frames))
@@ -2935,8 +2971,18 @@ class RollPage(QWidget):
     def _on_progress(self, done: int, total: int) -> None:
         self._update_info(done, total)
 
+    def _on_frame_failed(self, idx: int, msg: str) -> None:
+        if 0 <= idx < len(self.roll.frames):
+            self.roll.frames[idx].error = msg
+            self.canvas.viewport().update()
+
     def _update_info(self, done: int, total: int) -> None:
-        self.info.setText(f"{total} frames" if done >= total else f"Developing… {done}/{total}")
+        text = f"{total} frames" if done >= total else f"Developing… {done}/{total}"
+        failed = [f.error for f in self.roll.frames if f.error]
+        if failed:
+            text += f"  ·  {len(failed)} couldn't be opened"
+            self.info.setToolTip("\n".join(failed))
+        self.info.setText(text)
 
     def _combo_menu(self, kind: str, name: str, gpos: QPoint) -> None:
         menu = QMenu(self)
@@ -3011,7 +3057,7 @@ class RollPage(QWidget):
 
     def shutdown(self) -> None:
         self.loader.stop()
-        self.loader.wait(3000)
+        self.loader.wait()  # stops after the current file; a QThread destroyed while running aborts the app
 
 
 class MainWindow(QMainWindow):
@@ -3420,12 +3466,12 @@ class MainWindow(QMainWindow):
         for page in self.pages():
             page.flush_sync()
         self.sync_worker.stop()
-        self.sync_worker.wait(8000)
+        self.sync_worker.wait()  # finish writing pending sidecars before quitting
         for page in self.pages():
             page.shutdown()
         for worker in (self._upd_worker, self._upd_install):
             if worker is not None and worker.isRunning():
-                worker.wait(2500)
+                worker.wait()  # bounded by the workers' own network / git timeouts
         event.accept()
 
     def show_about(self, tab: int = 0) -> None:
@@ -3684,6 +3730,12 @@ def main() -> int:
     exporting = "--export-icon" in sys.argv
     if exporting:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    kind = install_kind()
+    # Identity must be set before QApplication exists: Qt registers the app ID with the
+    # desktop portal during start-up, and changing it afterwards fails on Wayland.
+    QApplication.setApplicationName("proofmark")
+    QApplication.setApplicationVersion(APP_VERSION)
+    QApplication.setDesktopFileName(APP_ID if kind in ("flatpak", "system") else "proofmark")
     app = QApplication(sys.argv)
     if exporting:
         i = sys.argv.index("--export-icon")
@@ -3691,11 +3743,7 @@ def main() -> int:
         build_icon_pixmap(512).save(str(out), "PNG")
         print(f"Wrote {out}")
         return 0
-    kind = install_kind()
-    app.setApplicationName("proofmark")
-    app.setApplicationVersion(APP_VERSION)
     app.setApplicationDisplayName(APP_NAME)
-    app.setDesktopFileName(APP_ID if kind in ("flatpak", "system") else "proofmark")
     set_accent(str(cfg.setting("accent")))
     app.setStyleSheet(build_style(str(cfg.setting("font_family")), int(cfg.setting("font_size")), ACCENT_HEX))
     first_time = not cfg.data.get("desktop_shortcut_made", False)
@@ -3707,6 +3755,12 @@ def main() -> int:
     win.showMaximized()  # fills the screen but keeps the title bar (move / resize / close); F11 = true full screen
     QTimer.singleShot(0, win.offer_session_restore)
     QTimer.singleShot(5000, win._auto_update_check)
+    # Ctrl+C in the terminal: close the window normally (saves the session and sidecars).
+    # Python only sees the signal when it runs some code, so a timer wakes it periodically.
+    signal.signal(signal.SIGINT, lambda *_a: win.close())
+    wake = QTimer()
+    wake.timeout.connect(lambda: None)
+    wake.start(250)
     return app.exec()
 
 

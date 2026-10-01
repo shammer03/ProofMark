@@ -21,8 +21,8 @@
   <content_rating type="oars-1.1"/>
   <supports><control>pointing</control><control>keyboard</control></supports>
   <provides><binary>proofmark</binary></provides>
-  <url type="homepage">https://github.com/shammer03/proofmark</url>
-  <url type="bugtracker">https://github.com/shammer03/proofmark/issues</url>
+  <url type="homepage">https://github.com/shammer03/ProofMark</url>
+  <url type="bugtracker">https://github.com/shammer03/ProofMark/issues</url>
   <!-- TODO: add at least one <screenshot> (required by Flathub) -->
   <releases>
     <release version="1.1.0" date="2026-09-30">

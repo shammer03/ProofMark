@@ -3,7 +3,8 @@
 Darkroom contact-sheet proofing with wax grease-pencil marks (Fedora, PySide6).
 
 ## Run
-    sudo dnf install python3-pyside6 python3-pillow python3-rawpy perl-Image-ExifTool
+    sudo dnf install python3-pyside6 python3-pillow perl-Image-ExifTool
+    pip install --user rawpy        # optional, for RAW files (Fedora has no python3-rawpy package)
     python3 proofmark.py            # python3 proofmark.py --version
 
 ## Release workflow

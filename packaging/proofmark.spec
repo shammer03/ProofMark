@@ -4,7 +4,7 @@ Version:        1.1.0
 Release:        1%{?dist}
 Summary:        Darkroom contact-sheet proofing with wax grease-pencil marks
 License:        GPL-3.0-or-later
-URL:            https://github.com/shammer03/proofmark
+URL:            https://github.com/shammer03/ProofMark
 Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 BuildArch:      noarch
 
@@ -22,7 +22,7 @@ rebate and lets you mark it up with a wax grease pencil. It includes a loupe,
 compare mode, equipment inventory, and clean contact sheet printing.
 
 %prep
-%autosetup
+%autosetup -n ProofMark-%{version}
 
 %install
 install -Dpm 0644 proofmark.py %{buildroot}%{_datadir}/%{name}/proofmark.py
