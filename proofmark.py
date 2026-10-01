@@ -1062,7 +1062,7 @@ def mark_polylines(mark: Mark, rect: QRectF) -> list[list[QPointF]]:
         if length < 1.0:
             return []
         ang = math.atan2(b.y() - a.y(), b.x() - a.x())
-        head = (min(length * 0.35, rect.width() * 0.07) + 2.0) * max(0.6, mark.size)
+        head = (min(length * 0.35, rect.width() * 0.07) + 2.0) * max(0.6, stroke_scale(mark.size) / 2)
         h1 = QPointF(b.x() - head * math.cos(ang - 0.5), b.y() - head * math.sin(ang - 0.5))
         h2 = QPointF(b.x() - head * math.cos(ang + 0.5), b.y() - head * math.sin(ang + 0.5))
         return [[a, b], [h1, b, h2]]
@@ -1090,7 +1090,7 @@ def mark_polylines(mark: Mark, rect: QRectF) -> list[list[QPointF]]:
                 [QPointF(box.left(), box.top() - ext), QPointF(box.left(), box.bottom() + ext)],
                 [QPointF(box.right(), box.top() - ext), QPointF(box.right(), box.bottom() + ext)]]
     c = P(mark.pts[0])
-    r = 0.075 * min(rect.width(), rect.height()) * mark.size
+    r = 0.075 * min(rect.width(), rect.height()) * glyph_scale(mark.size)
     if k == T_STAR:
         rr = r * 1.15
         return [[QPointF(c.x() + rr * math.cos(-math.pi / 2 + 4 * math.pi / 5 * i),
@@ -1152,7 +1152,7 @@ def mark_bounds_px(mark: Mark, rect: QRectF) -> QRectF:
         ys = [_px(rect, p).y() for p in mark.pts]
         return QRectF(QPointF(min(xs), min(ys)), QPointF(max(xs), max(ys)))
     c = _px(rect, mark.pts[0])
-    r = point_unit(mark, rect) * mark.size
+    r = point_unit(mark, rect) * glyph_scale(mark.size)
     return QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r)
 
 
@@ -1203,14 +1203,50 @@ def fit_point_mark(mark: Mark, rect: QRectF, anchor: QPointF, pos: QPointF, min_
     if side <= min_drag:
         return False
     unit = max(1.0, point_unit(mark, rect))
-    mark.size = max(0.25, min(8.0, side / 2 / unit))
-    r = unit * mark.size
+    mark.size = max(0.25, min(8.0, size_for_glyph(side / 2 / unit)))
+    r = unit * glyph_scale(mark.size)
     mark.pts = [_norm(rect, anchor.x() + math.copysign(r, dx or 1.0), anchor.y() + math.copysign(r, dy or 1.0))]
     return True
 
 
+LINE_STRING_PX = 12.0  # stabiliser string length in screen pixels
+
+
+def _rdp(pts: list[QPointF], eps: float) -> list[QPointF]:
+    """Ramer-Douglas-Peucker: drop points that sit within `eps` of the line through their neighbours."""
+    if len(pts) < 3:
+        return pts
+    a, b = pts[0], pts[-1]
+    idx, far = 0, -1.0
+    for i in range(1, len(pts) - 1):
+        d = _seg_dist(pts[i], a, b)
+        if d > far:
+            idx, far = i, d
+    if far <= eps:
+        return [a, b]
+    return _rdp(pts[: idx + 1], eps)[:-1] + _rdp(pts[idx:], eps)
+
+
+def smooth_line(npts: list[list[float]], rect: QRectF) -> list[list[float]]:
+    """Finished freehand line: thin out the wobble, then round the corners into a calm curve."""
+    if len(npts) < 3:
+        return npts
+    pts = _rdp([_px(rect, q) for q in npts], 2.0)
+    for _ in range(3):  # Chaikin corner cutting, ends kept
+        if len(pts) < 3:
+            break
+        out = [pts[0]]
+        for a, b in zip(pts, pts[1:]):
+            out.append(QPointF(0.75 * a.x() + 0.25 * b.x(), 0.75 * a.y() + 0.25 * b.y()))
+            out.append(QPointF(0.25 * a.x() + 0.75 * b.x(), 0.25 * a.y() + 0.75 * b.y()))
+        out.append(pts[-1])
+        pts = out
+    res = [_norm(rect, q.x(), q.y()) for q in pts]
+    return res if len(res) >= 3 else res + [list(res[-1])] * (3 - len(res))
+
+
 def default_box_pts(rect: QRectF, n: list[float], scale: float) -> list[list[float]]:
-    half = 0.15 * min(rect.width(), rect.height()) * scale
+    half = 0.15 * min(rect.width(), rect.height()) * max(0.05, scale) ** 0.6
     hx = min(0.49, half / max(1e-6, rect.width()))
     hy = min(0.49, half / max(1e-6, rect.height()))
     cx, cy = min(1 - hx, max(hx, n[0])), min(1 - hy, max(hy, n[1]))
@@ -1261,8 +1297,22 @@ def resize_mark(mark: Mark, rect: QRectF, handle: str, pos: QPointF, orig: dict[
         mark.pts = out
 
 
+def glyph_scale(size: float) -> float:
+    """Star / X / + / - size for a brush size: 25% still reads, 400% is big without filling the frame."""
+    return 1.6 * max(0.05, size) ** 0.6
+
+
+def size_for_glyph(scale: float) -> float:
+    return (max(1e-3, scale) / 1.6) ** (1 / 0.6)
+
+
+def stroke_scale(size: float) -> float:
+    """Pen thickness for a brush size: 100% draws a solid line, 25% stays visible, 400% is bold (not huge)."""
+    return 2.0 * max(0.05, size) ** 0.6
+
+
 def draw_mark(painter: QPainter, mark: Mark, rect: QRectF, width: float) -> None:
-    render_pen_strokes(painter, mark_polylines(mark, rect), width * mark.size, QColor(mark.color),
+    render_pen_strokes(painter, mark_polylines(mark, rect), width * stroke_scale(mark.size), QColor(mark.color),
                        mark.seed, mark.style, rect.topLeft())
 
 
@@ -3732,9 +3782,18 @@ class ContactSheetCanvas(QAbstractScrollArea):
                     mark.pts = [norm_in_rect(rect, start)]
                     mark.size = self.brush_size
             elif mark.kind == T_LINE:
-                last = mark.pts[-1]
-                if math.hypot(n[0] - last[0], n[1] - last[1]) > 0.002:
-                    mark.pts.append(n)
+                # Stabiliser ("lazy brush"): the pen trails the cursor on a short string, so hand shake
+                # inside the string's length never reaches the paper.
+                pen = self._drag.setdefault("pen", QPointF(self._drag["start"]))
+                dx, dy = pos.x() - pen.x(), pos.y() - pen.y()
+                dist = math.hypot(dx, dy)
+                string = LINE_STRING_PX
+                if dist > string:
+                    pen = QPointF(pen.x() + dx * (dist - string) / dist, pen.y() + dy * (dist - string) / dist)
+                    self._drag["pen"] = pen
+                    last = _px(rect, mark.pts[-1])
+                    if math.hypot(pen.x() - last.x(), pen.y() - last.y()) > 1.5:
+                        mark.pts.append(norm_in_rect(rect, pen))
             else:
                 mark.pts[1] = n
         elif not self.loupe_locked:
@@ -3766,6 +3825,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
             if is_point:
                 valid = True
             elif mark.kind == T_LINE:
+                mark.pts = smooth_line(mark.pts, rect)
                 valid = len(mark.pts) >= 3
             else:
                 a, b = mark.pts[0], mark.pts[1]
@@ -4102,7 +4162,8 @@ KEYS_TEXT = (
     "P or *  Star           X  Boxed reject      + / -  Exposure push / pull\n"
     "#  Crop box            R  Squircle ring     L  Line      A  Arrow\n"
     "E  Adjust (select / move / resize marks)\n"
-    "MODES  V or Esc  Loupe mode (look only, tools off)     Any tool key or ✎ Mark  Mark mode\n\n"
+    "MODES  V or Esc  Loupe mode (look only, tools off)     Any tool key or ✎ Mark  Mark mode\n"
+    "In Mark mode, Space or right-click enlarges the frame so you can mark it up close\n\n"
     "PLACING MARKS\n"
     "Click places at the brush size.  Click-drag draws every mark from the corner you press\n"
     "towards the cursor, like a box.  Box, arrow and line stay selected so you can drag\n"
@@ -4247,7 +4308,8 @@ class MainWindow(QMainWindow):
             if tool == T_INSPECT:
                 self.mark_mode_action = QAction("✎ Mark", self)
                 self.mark_mode_action.setCheckable(True)
-                self.mark_mode_action.setToolTip("Mark mode: grease-pencil tools on, hover loupe off\n"
+                self.mark_mode_action.setToolTip("Mark mode: grease-pencil tools on. Hover still magnifies;\n"
+                                                 "Space or right-click enlarges a frame to mark it up close\n"
                                                  "(any tool key, e.g. P or X, also switches here)")
                 self.mark_mode_action.triggered.connect(lambda _c=False: self.set_tool(self.mark_tool))
                 modes.addAction(self.mark_mode_action)
@@ -4460,7 +4522,7 @@ class MainWindow(QMainWindow):
             page.canvas.set_loupe_enabled(self._hover_loupe_on())
 
     def _hover_loupe_on(self) -> bool:
-        return self.tool == T_INSPECT and bool(self.cfg.setting("hover_loupe"))
+        return bool(self.cfg.setting("hover_loupe"))  # both modes; Mark mode only adds the tools
 
     def _update_mode_ui(self) -> None:
         """Loupe mode greys the marking tools out; Mark mode turns them on."""
