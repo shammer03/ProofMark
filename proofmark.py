@@ -5942,7 +5942,9 @@ class MainWindow(QMainWindow):
             self.filter_combo.setCurrentIndex(max(0, self.filter_combo.findData(state.get("filter", "all"))))
             self._apply_brush(float(state.get("brush_size", 1.0)), state.get("brush_color", DEFAULT_BRUSH_COLOR),
                               str(state.get("brush_style", DEFAULT_PEN)))
-            self.set_tool(state.get("tool", T_INSPECT) if state.get("tool") in self.tool_actions else T_INSPECT)
+            if state.get("tool") in self.tool_actions and state.get("tool") != T_INSPECT:
+                self.mark_tool = state["tool"]  # remembered for the Mark button; ProofMark opens in Loupe mode
+            self.set_tool(T_INSPECT)
             for r in rolls:
                 folder = Path(r.get("folder", ""))
                 if folder.is_dir():
@@ -6389,6 +6391,9 @@ def main() -> int:
     QApplication.setApplicationVersion(APP_VERSION)
     QApplication.setDesktopFileName(APP_ID if kind in ("flatpak", "system") else "proofmark")
     app = QApplication(sys.argv)
+    # A little quicker than the desktop's double-click time: a Mark-mode click waits this long
+    # before zooming (in case a second click makes it a double-click), and Qt uses the same value.
+    app.setDoubleClickInterval(max(200, int(QApplication.doubleClickInterval() * 0.8)))
     if exporting:
         i = sys.argv.index("--export-icon")
         out = Path(sys.argv[i + 1]) if i + 1 < len(sys.argv) else Path("proofmark-512.png")
