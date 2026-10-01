@@ -3144,6 +3144,9 @@ class ContactSheetCanvas(QAbstractScrollArea):
             return
         self._rotate(idx, steps)
         self._record(("rotate", idx, steps))
+        self.selected = idx
+        self.status.emit(f"Frame {idx + 1}A rotated {'clockwise' if steps > 0 else 'counter-clockwise'}"
+                         "  (display only; the file is unchanged)")
         self.marksChanged.emit(idx)
         self.viewport().update()
 
@@ -3429,15 +3432,11 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.marksChanged.emit(idx)
         self.viewport().update()
 
-    def pop_topmost(self, idx: int) -> None:
-        if 0 <= idx < len(self.frames) and self.frames[idx].marks:
-            self._remove_mark(idx, self.frames[idx].marks[-1])
-        else:
-            self.undo()
-
     # ── culling: current frame, ratings, rejects, notes ─────────────────────
     def _target_frame(self) -> int:
         """Frame a key acts on: the one under the mouse, unless you were just moving with the arrow keys."""
+        if self.loupe_locked and self.locked_index in self._pos:
+            return self.locked_index
         if not self._kbd_nav and self.hover_index in self._pos:
             return self.hover_index
         if self.selected in self._pos:
@@ -3881,10 +3880,14 @@ class ContactSheetCanvas(QAbstractScrollArea):
             if any(m is mk for m in self.frames[fi].marks):
                 self._retract_add(fi, mk)
             self._last_click_added = None
-        if self._click_locked:
-            self.loupe_locked = False
+        # Double-click never changes marks: it enlarges a frame, or returns from the enlarged view.
+        if self._click_locked:  # the first click just enlarged it (Loupe mode): keep it open
             self._click_locked = False
-        self.pop_topmost(idx)
+        elif self.loupe_locked:
+            self.loupe_locked = False
+        elif idx >= 0:
+            self._lock_loupe(idx, pos)
+        self.viewport().update()
 
     def wheelEvent(self, e) -> None:  # noqa: N802
         if e.modifiers() & Qt.ControlModifier:
@@ -4025,7 +4028,7 @@ class RollPage(QWidget):
         for kind, combo in (("film", self.film_combo), ("camera", self.camera_combo), ("lens", self.lens_combo)):
             combo.itemContextRequested.connect(lambda name, pos, k=kind: self._combo_menu(k, name, pos))
             combo.setToolTip("Right-click for favorites / edit")
-            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)  # full names, focal length included
             combo.setMinimumContentsLength(14)
             combo.view().setMinimumWidth(380)
         self.info = QLabel("")
@@ -4206,7 +4209,8 @@ KEYS_TEXT = (
     "View  Full screen, or the sheet as it prints on 4×6, 5×7 or 8×10     Show  filter frames\n"
     "Ctrl+Wheel  Zoom 0.7×–4.5×     Right-drag  Pan     Ctrl+0  Reset zoom\n"
     "C  2-up compare (hover for [B]); C or Esc exits\n\n"
-    "UNDO\nCtrl+Z  Undo     Ctrl+Shift+Z  Redo     Double-click  Remove the frame's top mark\n\n"
+    "UNDO\nCtrl+Z  Undo     Ctrl+Shift+Z  Redo     Delete  Remove the selected mark\n"
+    "Double-click  Enlarge a frame / return from the enlarged view (never changes marks)\n\n"
     "FILE\nCtrl+O Import   Ctrl+P Print   Ctrl+Shift+E PDF   Ctrl+Shift+S Export selects   Ctrl+S Sync Data\n"
     "Ctrl+, Settings   F11 Full screen")
 
@@ -4349,6 +4353,12 @@ class MainWindow(QMainWindow):
         self.compare_action.setToolTip("2-up compare  (C)  — hover to change [B]; C / Esc exits")
         self.compare_action.triggered.connect(self._compare_clicked)
         tb.addAction(self.compare_action)
+        for text, steps, tip in (("⟲", -1, "Rotate the frame counter-clockwise  (Ctrl+[)"),
+                                 ("⟳", 1, "Rotate the frame clockwise  (Ctrl+])")):
+            act = QAction(text, self)
+            act.setToolTip(tip + "\nActs on the enlarged frame, or the last one you clicked. Display only.")
+            act.triggered.connect(lambda _c=False, n=steps: self._canvas_call("rotate_frame", n))
+            tb.addAction(act)
         self.print_action = QAction("Print Sheet", self)
         self.print_action.setToolTip("Print the contact sheet as shown: View size and Show filter  (Ctrl+P)\n"
                                      "Settings ▸ Printing: clean sheet or with your marks, ratings and notes")
