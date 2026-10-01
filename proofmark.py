@@ -3073,7 +3073,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
       click            -> switch 60% / 95% enlarged view (double-click = click); right-click / Space too
       wheel            -> while a view shows: grow it to 95%, then magnify the photo to 200%
       drag (Mark mode) -> draw a mark from the press point
-      right-drag       -> pan a magnified view
+      drag (Loupe mode)/right-drag -> move a magnified photo
       Delete           -> remove the selected mark, else the newest mark on the photo under the cursor
       Ctrl+Z / Ctrl+Shift+Z -> undo / redo
       C                -> 2-up compare (A locked, B follows hover); C / Esc exits
@@ -3206,6 +3206,10 @@ class ContactSheetCanvas(QAbstractScrollArea):
         return self.loupe_geometry(self.hover_index, False)[0]
 
     def _update_cursor(self, pos: QPointF) -> None:
+        if (self.loupe_locked and self.zoom > 1.0 and self.tool == T_INSPECT
+                and self.loupe_geometry(self.locked_index, True)[0].contains(pos)):
+            self.viewport().setCursor(Qt.OpenHandCursor)  # magnified: drag to move the photo
+            return
         cur = Qt.ArrowCursor
         target = None if self.compare else self._target_at(pos)
         if target and self.tool != T_INSPECT:
@@ -3937,6 +3941,10 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 draws = not self._press.get("adjust") and (self.tool in POINT_TOOLS or self.tool in DRAG_TOOLS)
                 self._press = None
                 if not draws:  # Loupe mode (or Adjust on empty space): a drag is not a click
+                    if self.loupe_locked and self.zoom > 1.0:
+                        self._pan_last = QPointF(start)  # grab the magnified photo and move it
+                        self.viewport().setCursor(Qt.ClosedHandCursor)
+                        self.mouseMoveEvent(e)
                     return
                 rect = self._rect_for(idx)
                 is_point = self.tool in POINT_TOOLS
@@ -3986,8 +3994,9 @@ class ContactSheetCanvas(QAbstractScrollArea):
         if e.button() == Qt.LeftButton and self._press is not None:
             press, self._press = self._press, None
             self._toggle_zoom(press)
-        if e.button() == Qt.RightButton:
+        if e.button() in (Qt.RightButton, Qt.LeftButton) and self._pan_last is not None:
             self._pan_last = None
+            self._update_cursor(e.position())
         if e.button() == Qt.LeftButton and self._edit is not None:
             ed = self._edit
             self._edit = None
@@ -4379,7 +4388,7 @@ KEYS_TEXT = (
     "VIEWING  (the same in Loupe and Mark mode)\n"
     "Hover  60% view beside the frame     Click (or double-click)  60% / 95%     Esc  Back\n"
     "Wheel  Grow the view to 95%, then magnify the photo to 200% (stops at 75 / 95 / 150 / 200%)\n"
-    "Shift+Wheel  Scroll the sheet     Right-drag  Pan     Ctrl+0  Back to 95%\n"
+    "Shift+Wheel  Scroll the sheet     Drag (Loupe) / right-drag  Move a magnified photo     Ctrl+0  Back to 95%\n"
     "View  Full screen, or the sheet as it prints on 4×6, 5×7 or 8×10     Show  filter frames\n"
     "C  2-up compare (hover for [B]); C or Esc exits\n\n"
     "UNDO\nCtrl+Z / ↶ Undo     Ctrl+Shift+Z / ↷ Redo\n"
