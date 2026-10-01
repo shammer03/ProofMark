@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent
 APP = ROOT / "proofmark.py"
 PKG = ROOT / "packaging"
 DIST = ROOT / "dist"
-METAINFO = PKG / "io.github.proofmark.ProofMark.metainfo.xml"
+METAINFO = PKG / "io.github.shammer03.ProofMark.metainfo.xml"
 SPEC = PKG / "proofmark.spec"
 MARKER = "    # <changelog-insert>\n"
 
