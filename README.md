@@ -15,6 +15,7 @@ ProofMark is non-destructive, like RapidRAW. For `photo.jpg` it writes only side
   "Film · Camera · Lens" UserComment to its `exif` section; RapidRAW applies them when it exports.
   Your RapidRAW edits, rating and tags are kept, and a field you change in RapidRAW is never overwritten.
 - `photo.xmp` — rating and marks for other apps (an existing `.xmp` from another app is left alone)
+- `.proofmark-roll.json` in the roll folder — roll title, shot date, lab, keywords, notes and frame order
 
 exiftool is optional: it is only used to read RAW files' EXIF the first time a `.rrdata` is created.
 

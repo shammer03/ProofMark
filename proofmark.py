@@ -30,12 +30,12 @@ import subprocess
 import sys
 import zlib
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 from xml.sax.saxutils import escape, quoteattr
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageChops, ImageFilter, ImageOps
 
 try:
     import rawpy  # type: ignore
@@ -44,7 +44,7 @@ except ImportError:  # RAW support degrades gracefully
 
 from PySide6.QtCore import QMarginsF, QProcess, QSizeF, QUrl
 from PySide6.QtGui import QDesktopServices, QPageLayout, QPageSize
-from PySide6.QtWidgets import QCheckBox, QColorDialog, QFontComboBox, QTextBrowser, QToolButton
+from PySide6.QtWidgets import QCheckBox, QColorDialog, QFontComboBox, QPlainTextEdit, QTextBrowser, QToolButton
 
 try:  # print support ships with PySide6 on Fedora; degrade gracefully if missing
     from PySide6.QtPrintSupport import QPrintDialog, QPrinter
@@ -62,7 +62,8 @@ from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QComboBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMainWindow, QMenu,
-                               QMessageBox, QPushButton, QRadioButton, QSizePolicy, QSlider, QSpinBox,
+                               QMessageBox, QProgressDialog, QPushButton, QRadioButton, QSizePolicy, QSlider,
+                               QSpinBox,
                                QStyle, QStyleOptionSlider, QSystemTrayIcon, QTabWidget,
                                QVBoxLayout, QWidget)
 
@@ -426,6 +427,7 @@ class Frame:
         self.user_rating: Optional[int] = None  # set with the 1-5 keys; None = from the Star marks
         self.note: str = ""                     # darkroom note
         self.rotation: int = 0                  # quarter turns clockwise, display only
+        self.label: str = ""                    # colour label: red / yellow / green / blue / purple
         self.thumb0: Optional[QImage] = None    # as decoded, before rotation
         self.preview0: Optional[QImage] = None
 
@@ -448,46 +450,132 @@ class Frame:
 
     def extras(self) -> dict[str, Any]:
         """Per-frame data besides marks, as stored in .pmdata and the session."""
-        return {"user_rating": self.user_rating, "note": self.note, "rotation": self.rotation}
+        return {"user_rating": self.user_rating, "note": self.note, "rotation": self.rotation, "label": self.label}
 
     def apply_extras(self, d: dict[str, Any]) -> None:
         r = d.get("user_rating")
         self.user_rating = int(r) if isinstance(r, (int, float)) and 0 <= r <= 5 else None
         self.note = str(d.get("note") or "")
         self.rotation = int(d.get("rotation") or 0) % 4
+        label = str(d.get("label") or "")
+        self.label = label if label in LABEL_COLORS else ""
 
     @property
     def sidecar(self) -> Path:
         return pm_sidecar_path(self.path)
 
 
+NUMBER_STYLES = [("edge", "Film edge  (12A)"), ("edge0", "Film edge, two digits  (01A)"),
+                 ("simple", "Simple  (#12)"), ("none", "No frame numbers")]
+NUMBERING = {"style": "edge", "start": 1}  # set from Settings ▸ Contact Sheet
+LABEL_COLORS = {"red": "#E5484D", "yellow": "#F5D90A", "green": "#46A758", "blue": "#3E63DD", "purple": "#8E4EC6"}
+
+
+def format_frame_number(n: int) -> str:
+    style = NUMBERING.get("style", "edge")
+    if style == "none":
+        return ""
+    if style == "simple":
+        return f"#{n:02d}"
+    return f"{n:02d}A" if style == "edge0" else f"{n}A"
+
+
+_BRANDS = {"kodak", "fujifilm", "fuji", "ilford", "cinestill", "rollei", "agfa", "foma", "fomapan", "lomography",
+           "kentmere", "adox", "harman", "fujichrome", "plus", "ii", "film", "the"}
+
+
+def parse_folder_info(name: str, film_names: list[str]) -> tuple[str, str]:
+    """(shot date "YYYY-MM-DD", film) read from a roll folder name like 2026-08-20_Kodak-Portra-400."""
+    date = ""
+    m = re.search(r"(19|20)\d\d[-_. ]?(0[1-9]|1[0-2])[-_. ]?(0[1-9]|[12]\d|3[01])", name)
+    if m:
+        digits = re.sub(r"\D", "", m.group(0))
+        date = f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    words = set(re.split(r"[\s_\-.]+", name.lower()))
+    best, best_score = "", 0.0
+    for film in film_names:
+        need = [w for w in re.split(r"[\s\-]+", film.lower()) if w and w not in _BRANDS]
+        names = [w for w in need if not w.isdigit()]       # gold, portra, hp5, 320t, tri, x ...
+        hit = [w for w in names if w in words and (len(w) >= 3 or any(c.isdigit() for c in w) or len(names) > 1)]
+        if not hit:  # an ISO number alone never identifies a film
+            continue
+        score = 2 * len(hit) + sum(1 for w in need if w.isdigit() and w in words) - 0.5 * (len(names) - len(hit))
+        if score > best_score:
+            best, best_score = film, score
+    return date, best
+
+
 class Roll:
-    """A folder of frames plus its equipment assignment."""
+    """A folder of frames plus its equipment, roll info, frame order and hidden frames."""
 
     def __init__(self, folder: Path, film: str, camera: str, lens: str) -> None:
         self.folder = folder
         self.film = film
         self.camera = camera
         self.lens = lens
+        try:
+            info = json.loads(self.note_file.read_text(encoding="utf-8"))
+            info = info if isinstance(info, dict) else {}
+        except (OSError, ValueError):
+            info = {}
+        self.title = str(info.get("title") or "")
+        self.shot_date = str(info.get("shot_date") or "")
+        self.lab = str(info.get("lab") or "")
+        self.note = str(info.get("note") or "")
+        self.keywords = [str(k) for k in info.get("keywords") or [] if str(k).strip()]
         files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in ALL_EXTS]
         files.sort(key=lambda p: natural_key(p.name))
+        extra = [Path(x) for x in info.get("extra") or []]
+        files += [x for x in extra if x.is_file() and x.suffix.lower() in ALL_EXTS and x.parent != folder]
         self.frames: list[Frame] = [Frame(p) for p in files]
-        self.note = ""  # roll note, kept in the folder's .proofmark-roll.json
-        try:
-            data = json.loads(self.note_file.read_text(encoding="utf-8"))
-            self.note = str(data.get("note") or "") if isinstance(data, dict) else ""
-        except (OSError, ValueError):
-            pass
+        # Display order and hidden frames are kept by file key, so they survive files being added.
+        pos = {k: n for n, k in enumerate(info.get("order") or [])}
+        self.order = sorted(range(len(self.frames)), key=lambda i: (pos.get(self.key(i), 10 ** 6), i))
+        hidden = set(info.get("hidden") or [])
+        self.hidden = {i for i in range(len(self.frames)) if self.key(i) in hidden}
 
     @property
     def note_file(self) -> Path:
         return self.folder / ".proofmark-roll.json"
 
-    def save_note(self) -> None:
+    def key(self, i: int) -> str:
+        p = self.frames[i].path
+        return p.name if p.parent == self.folder else str(p)
+
+    @property
+    def display_title(self) -> str:
+        return self.title or self.folder.name
+
+    def number(self, i: int) -> int:
+        """Frame number: position in the roll's order, hidden frames skipped."""
+        shown = [j for j in self.order if j not in self.hidden]
+        return (shown.index(i) if i in shown else len(shown)) + int(NUMBERING.get("start", 1))
+
+    def label(self, i: int) -> str:
+        return format_frame_number(self.number(i)) if i not in self.hidden else "—"
+
+    def add_files(self, paths: list[Path]) -> list[int]:
+        have = {fr.path.resolve() for fr in self.frames}
+        new = []
+        for p in paths:
+            if p.is_file() and p.suffix.lower() in ALL_EXTS and p.resolve() not in have:
+                self.frames.append(Frame(p))
+                self.order.append(len(self.frames) - 1)
+                new.append(len(self.frames) - 1)
+                have.add(p.resolve())
+        return new
+
+    def save_info(self) -> None:
         try:
-            atomic_write_json(self.note_file, {"version": 1, "note": self.note})
+            atomic_write_json(self.note_file, {
+                "version": 2, "title": self.title, "shot_date": self.shot_date, "lab": self.lab,
+                "note": self.note, "keywords": self.keywords,
+                "order": [self.key(i) for i in self.order], "hidden": sorted(self.key(i) for i in self.hidden),
+                "extra": [str(fr.path) for fr in self.frames if fr.path.parent != self.folder]})
         except OSError:
             pass
+
+    save_note = save_info
 
     def load_sidecar_marks(self) -> None:
         for fr in self.frames:
@@ -521,7 +609,7 @@ class Roll:
 
     def extras_table(self) -> dict[str, dict[str, Any]]:
         return {fr.name: fr.extras() for fr in self.frames
-                if fr.user_rating is not None or fr.note or fr.rotation}
+                if fr.user_rating is not None or fr.note or fr.rotation or fr.label}
 
 
 def atomic_write_json(path: Path, data: Any) -> None:
@@ -621,7 +709,7 @@ def _owned_rating_ok(current: Any, owned: Any) -> bool:
 
 
 def merge_rapidraw(image: Path, exif_values: dict[str, str], rating: int, tags: set[str],
-                   owned: dict[str, Any]) -> Optional[dict[str, Any]]:
+                   owned: dict[str, Any], label: str = "") -> Optional[dict[str, Any]]:
     """
     Merge ProofMark's data into RapidRAW's <image>.rrdata, keeping everything else in the file:
     `exif_values` into its "exif" map, `rating` (0-5) and `tags`. Each field is only written when it
@@ -662,6 +750,9 @@ def merge_rapidraw(image: Path, exif_values: dict[str, str], rating: int, tags: 
 
     current_tags = [t for t in (data.get("tags") or []) if isinstance(t, str)]
     ours = set(owned.get("tags") or [])
+    if label:  # RapidRAW shows one colour label: only add ours if you haven't set one there
+        if not any(t.startswith("color:") and t not in ours for t in current_tags):
+            tags = tags | {f"color:{label}"}
     kept = [t for t in current_tags if not (t in ours and t not in tags)]  # drop our tags for removed marks
     added = sorted(t for t in tags if t not in kept)
     new_owned["tags"] = sorted((ours & tags & set(kept)) | set(added))
@@ -686,33 +777,43 @@ _XMP_RATING_ATTR = re.compile(r'xmp:Rating\s*=\s*"([^"]*)"')
 _XMP_RATING_TAG = re.compile(r"<xmp:Rating\s*>([^<]*)</xmp:Rating>")
 
 
-def merge_xmp_rating(xmp: Path, rating: int, owned: Any) -> tuple[bool, Any]:
+def merge_xmp_prop(xmp: Path, prop: str, value: str, owned: Any) -> tuple[bool, Any]:
     """
-    Update xmp:Rating in another app's .xmp (Lightroom, darktable, digiKam, Capture One, RapidRAW),
-    leaving the rest of the file as it is. -1 means rejected. Only replaces a rating that is unset,
-    0, or still the one ProofMark wrote. Returns (file changed, rating ProofMark now owns).
+    Update xmp:<prop> (Rating, or Label for a Lightroom colour label) in another app's .xmp,
+    leaving the rest of the file as it is. Only replaces a value that is unset, empty / 0, or still
+    the one ProofMark wrote. Returns (file changed, value ProofMark now owns).
     """
     text = xmp.read_text(encoding="utf-8", errors="replace")
-    m = _XMP_RATING_ATTR.search(text) or _XMP_RATING_TAG.search(text)
+    attr = re.compile(rf'xmp:{prop}\s*=\s*"([^"]*)"')
+    tag = re.compile(rf"<xmp:{prop}\s*>([^<]*)</xmp:{prop}>")
+    m = attr.search(text) or tag.search(text)
     current = m.group(1).strip() if m else None
-    if not _owned_rating_ok(current, owned):
+    empty = "0" if prop == "Rating" else ""
+    if not (current in (None, "", empty) or (owned is not None and current == str(owned))):
         return False, None
-    if (current or "0") == str(rating):
-        return False, (rating or None)
-    if _XMP_RATING_ATTR.search(text):
-        text = _XMP_RATING_ATTR.sub(f'xmp:Rating="{rating}"', text, count=1)
-    elif _XMP_RATING_TAG.search(text):
-        text = _XMP_RATING_TAG.sub(f"<xmp:Rating>{rating}</xmp:Rating>", text, count=1)
+    if (current or empty) == value:
+        return False, (value if value != empty else None)
+    if attr.search(text):
+        text = attr.sub(f'xmp:{prop}="{value}"', text, count=1)
+    elif tag.search(text):
+        text = tag.sub(f"<xmp:{prop}>{value}</xmp:{prop}>", text, count=1)
+    elif value == empty:
+        return False, None
     elif "</rdf:Description>" in text:
         i = text.rfind("</rdf:Description>")
         ns = "" if "xmlns:xmp=" in text else ' xmlns:xmp="http://ns.adobe.com/xap/1.0/"'
-        text = text[:i] + f" <xmp:Rating{ns}>{rating}</xmp:Rating>\n" + text[i:]
+        text = text[:i] + f" <xmp:{prop}{ns}>{value}</xmp:{prop}>\n" + text[i:]
     else:
         return False, None
     tmp = xmp.with_name(xmp.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, xmp)
-    return True, (rating or None)
+    return True, (value if value != empty else None)
+
+
+def merge_xmp_rating(xmp: Path, rating: int, owned: Any) -> tuple[bool, Any]:
+    changed, now = merge_xmp_prop(xmp, "Rating", str(rating), None if owned is None else str(owned))
+    return changed, (int(now) if now not in (None, "") else None)
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -721,6 +822,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "default_columns": 6, "hover_loupe": True,
     "autosave_secs": 4, "sync_mode": "auto", "sync_delay": 2, "rapidraw_exif": True, "xmp_sync": True,
     "star_ratings": dict(DEFAULT_STAR_RATINGS), "print_marks": False, "tray_icon": True,
+    "sideways_verticals": False, "number_style": "edge", "number_start": 1,
+    "export_mode": "ask", "export_folder": str(Path.home() / "Pictures" / "Contact Sheets"),
+    "export_format": "jpg", "export_size": 8000, "export_fullres": False,
+    "histogram": False, "clipping": False, "peaking": False,
     "print_direct": False, "print_ink_saver": False, "print_header": True,
     "auto_update_check": True, "update_repo": "",
 }
@@ -2106,7 +2211,15 @@ class SettingsDialog(QDialog):
         self.cols = self._spin(2, 14, int(s("default_columns")), "")
         self.hover_loupe = QCheckBox("Loupe mode magnifies on hover (off: click to enlarge only)")
         self.hover_loupe.setChecked(bool(s("hover_loupe")))
+        self.num_style = QComboBox()
+        for key, label in NUMBER_STYLES:
+            self.num_style.addItem(label, key)
+        self.num_style.setCurrentIndex(max(0, self.num_style.findData(s("number_style"))))
+        self.num_start = self._spin(0, 99, int(s("number_start")), "")
+        self.num_start.setToolTip("Many rolls start at 0 or 00; 35 mm usually counts 1-36")
         fc.addRow("Columns in Full screen view", self.cols)
+        fc.addRow("Frame numbers", self.num_style)
+        fc.addRow("First frame number", self.num_start)
         fc.addRow(self.hover_loupe)
         tabs.addTab(cs, "Contact Sheet")
 
@@ -2163,17 +2276,50 @@ class SettingsDialog(QDialog):
         fp = QFormLayout(pr)
         self.print_direct = QCheckBox("One-click: print straight to the default printer (skip the print dialog)")
         self.print_direct.setChecked(bool(s("print_direct")))
-        self.ink_saver = QCheckBox("Ink saver: white film base and dark text instead of the dark screen look")
-        self.ink_saver.setChecked(bool(s("print_ink_saver")))
+        self.sheet_style = QComboBox()
+        self.sheet_style.addItem("Darkroom — black film base (like the screen)", False)
+        self.sheet_style.addItem("Gallery — white, dark text (saves ink)", True)
+        self.sheet_style.setCurrentIndex(1 if s("print_ink_saver") else 0)
+        self.sideways = QCheckBox("Lay vertical frames on their side, as on a strip of 35 mm film")
+        self.sideways.setChecked(bool(s("sideways_verticals")))
         self.print_header = QCheckBox("Print a header (roll, film, camera, lens, date) and page footer")
         self.print_header.setChecked(bool(s("print_header")))
         self.print_marks = QCheckBox("Print grease marks, ratings and notes on the sheet (off = clean sheet)")
         self.print_marks.setChecked(bool(s("print_marks")))
-        fp.addRow(self.print_direct)
-        fp.addRow(self.ink_saver)
+        # where exports go
+        self.export_ask = QRadioButton("Ask where to save, starting in the folder I used last")
+        self.export_fixed = QRadioButton("Save straight into my contact sheets folder:")
+        (self.export_fixed if s("export_mode") == "folder" else self.export_ask).setChecked(True)
+        self.export_folder = QLineEdit(str(s("export_folder")))
+        browse = QPushButton("Choose…")
+        browse.clicked.connect(self._choose_export_folder)
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(self.export_folder, 1)
+        folder_row.addWidget(browse)
+        self.export_format = QComboBox()
+        for key, label in EXPORT_FORMATS:
+            self.export_format.addItem(label, key)
+        self.export_format.setCurrentIndex(max(0, self.export_format.findData(s("export_format"))))
+        self.export_size = QComboBox()
+        for px, label in EXPORT_SIZES:
+            self.export_size.addItem(label, px)
+        self.export_size.setCurrentIndex(max(0, self.export_size.findData(int(s("export_size")))))
+        self.export_fullres = QCheckBox("Use the full-resolution scans (slower; sharper for the largest sizes)")
+        self.export_fullres.setChecked(bool(s("export_fullres")))
+        fp.addRow("Sheet style", self.sheet_style)
+        fp.addRow(self.sideways)
         fp.addRow(self.print_header)
         fp.addRow(self.print_marks)
-        tabs.addTab(pr, "Printing")
+        fp.addRow(self.print_direct)
+        fp.addRow(QLabel(""))
+        fp.addRow(QLabel("<b>Export (PDF and image)</b>"))
+        fp.addRow(self.export_ask)
+        fp.addRow(self.export_fixed)
+        fp.addRow("", folder_row)
+        fp.addRow("Image format", self.export_format)
+        fp.addRow("Image size (long edge)", self.export_size)
+        fp.addRow(self.export_fullres)
+        tabs.addTab(pr, "Printing && Export")
 
         # ── Updates ──
         up = QWidget()
@@ -2219,6 +2365,12 @@ class SettingsDialog(QDialog):
         self.font_preview.setStyleSheet(f'color:#CCCCCC; padding: 6px; border: 1px solid #2a2a2a; '
                                         f'font-family: "{family}"; font-size: {self.font_size.value()}pt;')
 
+    def _choose_export_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Contact sheets folder", self.export_folder.text())
+        if folder:
+            self.export_folder.setText(folder)
+            self.export_fixed.setChecked(True)
+
     def _sync_now(self) -> None:
         win = self.parent()
         if win is not None and hasattr(win, "sync_all"):
@@ -2251,12 +2403,66 @@ class SettingsDialog(QDialog):
             "rapidraw_exif": self.rapidraw_exif.isChecked(), "xmp_sync": self.xmp_sync.isChecked(),
             "star_ratings": {h: sp.value() for h, sp in self.star_spins.items()},
             "print_marks": self.print_marks.isChecked(),
-            "print_direct": self.print_direct.isChecked(), "print_ink_saver": self.ink_saver.isChecked(),
+            "print_direct": self.print_direct.isChecked(), "print_ink_saver": bool(self.sheet_style.currentData()),
+            "sideways_verticals": self.sideways.isChecked(),
+            "number_style": self.num_style.currentData(), "number_start": self.num_start.value(),
+            "export_mode": "folder" if self.export_fixed.isChecked() else "ask",
+            "export_folder": self.export_folder.text().strip() or DEFAULT_SETTINGS["export_folder"],
+            "export_format": self.export_format.currentData(), "export_size": self.export_size.currentData(),
+            "export_fullres": self.export_fullres.isChecked(),
             "print_header": self.print_header.isChecked(), "auto_update_check": self.auto_update.isChecked(),
             "update_repo": self.repo.text().strip()}
         for key, value in values.items():
             self.cfg.set_setting(key, value)
         self.cfg.save()
+        self.accept()
+
+
+class RollInfoDialog(QDialog):
+    """Title, shot date, lab, keywords and notes for a roll."""
+
+    def __init__(self, roll: Roll, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.roll = roll
+        self.setWindowTitle(f"Roll Info — {roll.folder.name}")
+        self.resize(560, 420)
+        self.title = QLineEdit(roll.title)
+        self.title.setPlaceholderText(roll.folder.name)
+        self.date = QLineEdit(roll.shot_date)
+        self.date.setPlaceholderText("YYYY-MM-DD (read from the folder name when it has one)")
+        self.date.setInputMask("")
+        self.lab = QLineEdit(roll.lab)
+        self.lab.setPlaceholderText("Lab or development, e.g. Rodinal 1+50, 11 min, 20 °C")
+        self.keywords = QLineEdit(", ".join(roll.keywords))
+        self.keywords.setPlaceholderText("Comma separated, e.g. portrait, Emmy, Nashville")
+        self.note = QPlainTextEdit(roll.note)
+        self.note.setPlaceholderText("Notes for the whole roll: paper, printing ideas…")
+        form = QFormLayout()
+        form.addRow("Title", self.title)
+        form.addRow("Shot date", self.date)
+        form.addRow("Lab / developer", self.lab)
+        form.addRow("Keywords", self.keywords)
+        form.addRow("Notes", self.note)
+        hint = QLabel("Printed in the sheet header. Keywords become RapidRAW tags and .xmp keywords;\n"
+                      "the lab joins the film / camera / lens comment.")
+        hint.setStyleSheet("color:#999;")
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addWidget(hint)
+        lay.addWidget(buttons)
+
+    def _save(self) -> None:
+        date = self.date.text().strip()
+        if date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            QMessageBox.warning(self, "Shot date", "Please write the date as YYYY-MM-DD, or leave it empty.")
+            return
+        r = self.roll
+        r.title, r.shot_date, r.lab = self.title.text().strip(), date, self.lab.text().strip()
+        r.keywords = [k.strip() for k in self.keywords.text().split(",") if k.strip()]
+        r.note = self.note.toPlainText().strip()
         self.accept()
 
 
@@ -2348,7 +2554,7 @@ class ExportSelectsDialog(QDialog):
                     w = csv.writer(fh)
                     w.writerow(["frame", "file", "rating", "marks", "note", "roll", "film", "camera", "lens"])
                     for i, fr in frames:
-                        w.writerow([f"{i + 1}A", fr.name, fr.rating, " ".join(sorted({m.kind for m in fr.marks})),
+                        w.writerow([self.roll.label(i), fr.name, fr.rating, " ".join(sorted({m.kind for m in fr.marks})),
                                     fr.note, self.roll.folder.name, self.roll.film, self.roll.camera, self.roll.lens])
         except OSError as exc:
             QMessageBox.warning(self, "Export Selects", f"Export stopped:\n{exc}")
@@ -2506,9 +2712,10 @@ class ImageLoaderThread(QThread):
     frameFailed = Signal(int, str)
     progress = Signal(int, int)
 
-    def __init__(self, paths: list[Path], parent: Optional[QWidget] = None) -> None:
+    def __init__(self, paths: list[Path], parent: Optional[QWidget] = None, first: int = 0) -> None:
         super().__init__(parent)
         self.paths = paths
+        self.first = first  # index of paths[0] in the roll
         self._abort = False
 
     def stop(self) -> None:
@@ -2525,10 +2732,10 @@ class ImageLoaderThread(QThread):
                 preview.thumbnail((PREVIEW_W, PREVIEW_H), Image.LANCZOS)
                 thumb = preview.copy()
                 thumb.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
-                self.frameReady.emit(i, _pil_to_qimage(thumb), _pil_to_qimage(preview))
+                self.frameReady.emit(self.first + i, _pil_to_qimage(thumb), _pil_to_qimage(preview))
             except Exception as exc:  # corrupt file must never kill the loader
-                self.frameFailed.emit(i, f"{path.name}: {exc}")
-            self.progress.emit(i + 1, total)
+                self.frameFailed.emit(self.first + i, f"{path.name}: {exc}")
+            self.progress.emit(self.first + i + 1, self.first + total)
 
 
 @dataclass
@@ -2542,7 +2749,8 @@ class SyncJob:
     lens: str
     iso: int
     film: str
-    extras: dict[str, Any]  # keyboard rating, note, rotation
+    extras: dict[str, Any]  # keyboard rating, note, rotation, colour label
+    roll: dict[str, Any] = field(default_factory=dict)  # title, shot date, lab, keywords
 
 
 class RapidSyncWorker(QThread):
@@ -2604,20 +2812,23 @@ class RapidSyncWorker(QThread):
             pass
         owned_rr = old.get("rapidraw") or {"exif": old.get("rapidraw_exif") or {}}  # 1.1.2 kept only exif
         owned_xmp: dict[str, Any] = dict(old.get("xmp_owned") or {})
+        owned_lbl: dict[str, Any] = dict(old.get("xmp_label_owned") or {})
         kinds = {m.get("kind") for m in job.marks}
         rejected = job.rating < 0
         rating = max(0, job.rating)
 
         if self.rapidraw_exif:
             gear = [f"Film: {job.film} (ISO {job.iso})" if job.film else "",
-                    f"Camera: {job.camera}" if job.camera else "", f"Lens: {job.lens}" if job.lens else ""]
+                    f"Camera: {job.camera}" if job.camera else "", f"Lens: {job.lens}" if job.lens else "",
+                    f"Lab: {job.roll['lab']}" if job.roll.get("lab") else ""]
             values = {"Artist": job.artist, "Copyright": job.copyright,
                       "UserComment": "  ·  ".join(g for g in gear if g)}
             tags = {MARK_TAGS[k] for k in kinds if k in MARK_TAGS}
+            tags |= {f"user:{k.strip()}" for k in job.roll.get("keywords", []) if k.strip()}
             rr = rr_sidecar_path(job.path)
             before = rr.read_bytes() if rr.exists() else None
             try:
-                result = merge_rapidraw(job.path, values, rating, tags, owned_rr)
+                result = merge_rapidraw(job.path, values, rating, tags, owned_rr, job.extras.get("label", ""))
             except OSError:
                 result = None
             if result is None:
@@ -2636,7 +2847,9 @@ class RapidSyncWorker(QThread):
                     if not xmp.exists() or "ns.proofmark.app" in xmp.read_text(encoding="utf-8", errors="replace"):
                         continue
                     changed, owned_xmp[xmp.name] = merge_xmp_rating(xmp, xmp_rating, owned_xmp.get(xmp.name))
-                    counts["xmp"] += int(changed)
+                    label = (job.extras.get("label") or "").capitalize()  # Lightroom: Red, Yellow, Green...
+                    changed2, owned_lbl[xmp.name] = merge_xmp_prop(xmp, "Label", label, owned_lbl.get(xmp.name))
+                    counts["xmp"] += int(changed or changed2)
             # ProofMark's own .xmp when no other app has one (same name RapidRAW and Lightroom use)
             if not own_xmp.exists() or "ns.proofmark.app" in own_xmp.read_text(encoding="utf-8", errors="replace"):
                 own_xmp.write_text(self._xmp(job, xmp_rating), encoding="utf-8")
@@ -2644,7 +2857,8 @@ class RapidSyncWorker(QThread):
                 "version": 1, "file": job.path.name, "rating": job.rating, "marks": job.marks,
                 "film": job.film, "iso": job.iso, "camera": job.camera, "lens": job.lens,
                 "artist": job.artist, "copyright": job.copyright, **job.extras,
-                "rapidraw": owned_rr, "xmp_owned": {k: v for k, v in owned_xmp.items() if v is not None}})
+                "rapidraw": owned_rr, "xmp_owned": {k: v for k, v in owned_xmp.items() if v is not None},
+                "xmp_label_owned": {k: v for k, v in owned_lbl.items() if v}})
         except OSError:
             counts["warn"] += 1
         return counts
@@ -2654,6 +2868,17 @@ class RapidSyncWorker(QThread):
         kinds = [m["kind"] for m in job.marks]
         attrs = (f' xmp:Rating="{rating}" tiff:Model={quoteattr(job.camera)}'
                  f' aux:Lens={quoteattr(job.lens)} proofmark:Film={quoteattr(job.film)}')
+        if job.extras.get("label"):
+            attrs += f' xmp:Label="{escape(str(job.extras["label"]).capitalize())}"'
+        if job.roll.get("shot_date"):
+            attrs += f' photoshop:DateCreated={quoteattr(job.roll["shot_date"])}'
+        if job.roll.get("lab"):
+            attrs += f' proofmark:Lab={quoteattr(job.roll["lab"])}'
+        words = [k.strip() for k in job.roll.get("keywords", []) if k.strip()]
+        subject = ("<dc:subject><rdf:Bag>" + "".join(f"<rdf:li>{escape(k)}</rdf:li>" for k in words)
+                   + "</rdf:Bag></dc:subject>") if words else ""
+        title = (f'<dc:title><rdf:Alt><rdf:li xml:lang="x-default">{escape(job.roll["title"])}</rdf:li></rdf:Alt>'
+                 "</dc:title>") if job.roll.get("title") else ""
         artist = f"<dc:creator><rdf:Seq><rdf:li>{escape(job.artist)}</rdf:li></rdf:Seq></dc:creator>" if job.artist else ""
         rights = (f'<dc:rights><rdf:Alt><rdf:li xml:lang="x-default">{escape(job.copyright)}</rdf:li></rdf:Alt></dc:rights>'
                   if job.copyright else "")
@@ -2671,8 +2896,9 @@ class RapidSyncWorker(QThread):
             '   xmlns:tiff="http://ns.adobe.com/tiff/1.0/"\n'
             '   xmlns:exif="http://ns.adobe.com/exif/1.0/"\n'
             '   xmlns:aux="http://ns.adobe.com/exif/1.0/aux/"\n'
+            '   xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"\n'
             '   xmlns:proofmark="http://ns.proofmark.app/1.0/"' + attrs + '>\n'
-            f'   {artist}\n   {rights}\n   {desc}\n'
+            f'   {artist}\n   {rights}\n   {desc}\n   {title}\n   {subject}\n'
             f'   <exif:ISOSpeedRatings><rdf:Seq><rdf:li>{job.iso}</rdf:li></rdf:Seq></exif:ISOSpeedRatings>\n'
             f'   <proofmark:Marks><rdf:Bag>{marks}</rdf:Bag></proofmark:Marks>\n'
             '  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n<?xpacket end="w"?>\n')
@@ -2796,7 +3022,8 @@ def paint_rebate_strip(p: QPainter, cell: QRectF, rebate_h: float, number: str, 
 
 
 FILTERS = [("all", "All frames"), ("rated", "Stars & ratings"), ("3up", "3 ★ and up"),
-           ("norejects", "Hide rejects"), ("rejects", "Rejects only"), ("work", "Crop / push / pull")]
+           ("norejects", "Hide rejects"), ("rejects", "Rejects only"), ("work", "Crop / push / pull"),
+           ("labelled", "Colour labelled"), ("hidden", "Hidden frames")]
 FILTER_NAMES = dict(FILTERS)
 
 
@@ -2812,6 +3039,8 @@ def frame_passes(fr: Frame, key: str) -> bool:
         return r < 0
     if key == "work":
         return any(m.kind in (T_CROP, T_PUSH, T_PULL) for m in fr.marks)
+    if key == "labelled":
+        return bool(fr.label)
     return True
 
 
@@ -2819,7 +3048,12 @@ def paint_frame_badges(p: QPainter, slot: QRectF, img: QRectF, fr: Frame) -> Non
     """Rating stars (top right) and the darkroom note (bottom of the photo) on a frame."""
     p.save()
     p.setClipRect(slot)
-    small = max(7, int(slot.height() * 0.075))
+    small = min(18, max(7, int(slot.height() * 0.075)))  # same modest size on a thumbnail or in the loupe
+    if fr.label:  # colour label: a tab in the top-left corner
+        tab = QRectF(img.left() + 3, img.top() + 3, small * 1.25, small * 1.25)
+        p.setPen(QPen(QColor(0, 0, 0, 200), 1.0))
+        p.setBrush(QColor(LABEL_COLORS.get(fr.label, "#888888")))
+        p.drawRoundedRect(tab, small * 0.25, small * 0.25)
     if fr.rating > 0:
         font = QFont("DejaVu Sans")
         font.setPixelSize(small)
@@ -2844,23 +3078,40 @@ def paint_frame_badges(p: QPainter, slot: QRectF, img: QRectF, fr: Frame) -> Non
     p.restore()
 
 
-def paint_frame_clean(p: QPainter, cell: QRectF, rebate_h: float, idx: int, meta: dict[str, Any],
-                      pm: Optional[QPixmap], ink_saver: bool = False, marked: Optional[Frame] = None) -> None:
-    """One frame as on screen, without selection or hover. With `marked`, its grease marks, rating and note too."""
+def paint_frame_clean(p: QPainter, cell: QRectF, rebate_h: float, number: str, meta: dict[str, Any],
+                      pm: Optional[QPixmap], ink_saver: bool = False, marked: Optional[Frame] = None,
+                      sideways: bool = False) -> None:
+    """
+    One frame as on screen, without selection or hover. With `marked`, its grease marks, rating and
+    note too. `sideways` lays a vertical frame on its side, as it sits on a strip of 35 mm film.
+    """
     p.save()
     p.setClipRect(cell)
     p.fillRect(cell, QColor("#FFFFFF") if ink_saver else C_FILM)
     slot = frame_slot_rect(cell, rebate_h)
     p.fillRect(slot, QColor("#E6E6E6") if ink_saver else QColor("#0D0D0D"))
     if pm is not None and pm.height() > 0:
-        img = fit_rect(slot, pm.width() / pm.height())
+        aspect = pm.width() / pm.height()
+        turn = sideways and aspect < 1.0
+        if turn:  # draw in a turned coordinate system: the photo (and its marks) lie on their side
+            outer = fit_rect(slot, 1.0 / aspect)
+            p.save()
+            p.translate(outer.center())
+            p.rotate(-90)
+            img = QRectF(-outer.height() / 2, -outer.width() / 2, outer.height(), outer.width())
+        else:
+            img = fit_rect(slot, aspect)
         p.drawPixmap(img, pm, QRectF(pm.rect()))
         if marked is not None:
             width = max(1.5, img.width() * 0.011)
             for mk in marked.marks:
                 draw_mark(p, mk, img, width)
+        if turn:
+            p.restore()
+            img = outer
+        if marked is not None:
             paint_frame_badges(p, slot, img, marked)
-    paint_rebate_strip(p, cell, rebate_h, f"{idx + 1}A", meta, ink_saver)
+    paint_rebate_strip(p, cell, rebate_h, number, meta, ink_saver)
     p.setPen(QPen(QColor("#000000") if ink_saver else QColor("#1C1C1C"), max(1.0, cell.width() * 0.004)))
     p.setBrush(Qt.NoBrush)
     p.drawRect(cell)
@@ -2930,13 +3181,13 @@ def paint_sheet_text(p: QPainter, rect: QRectF, lay: SheetLayout, roll: Roll, pa
     font.setPixelSize(max(6, int(rect.height() * 0.014)))
     p.setFont(font)
     p.setPen(color)
-    title = f"{roll.folder.name}   ·   {roll.film}   ·   {roll.camera}   ·   {roll.lens}"
-    if roll.note:
-        title += "   ·   " + roll.note.replace("\n", "  ")
+    parts = [roll.display_title, roll.film, roll.camera, roll.lens, roll.lab, roll.note.replace("\n", "  ")]
+    title = "   ·   ".join(x for x in parts if x)
     top = QRectF(rect.x(), rect.y(), rect.width(), lay.head_h)
-    p.drawText(QRectF(top.x(), top.y(), top.width() * 0.75, top.height()), Qt.AlignVCenter | Qt.AlignLeft,
-               QFontMetrics(font, p.device()).elidedText(title, Qt.ElideRight, int(top.width() * 0.75)))
-    p.drawText(top, Qt.AlignVCenter | Qt.AlignRight, datetime.date.today().isoformat())
+    p.drawText(QRectF(top.x(), top.y(), top.width() * 0.78, top.height()), Qt.AlignVCenter | Qt.AlignLeft,
+               QFontMetrics(font, p.device()).elidedText(title, Qt.ElideRight, int(top.width() * 0.78)))
+    when = f"Shot {roll.shot_date}" if roll.shot_date else datetime.date.today().isoformat()
+    p.drawText(top, Qt.AlignVCenter | Qt.AlignRight, when)
     foot = QRectF(rect.x(), rect.bottom() - lay.foot_h, rect.width(), lay.foot_h)
     total = len(roll.frames) if count is None else count
     p.drawText(foot, Qt.AlignVCenter | Qt.AlignLeft, f"ProofMark v{APP_VERSION}  ·  {total} frames"
@@ -2944,14 +3195,42 @@ def paint_sheet_text(p: QPainter, rect: QRectF, lay: SheetLayout, roll: Roll, pa
     p.drawText(foot, Qt.AlignVCenter | Qt.AlignRight, f"Page {page + 1} of {lay.pages}")
 
 
-def render_contact_sheet(printer: Any, roll: Roll, columns: Optional[int], meta: dict[str, Any],
-                         pixmap_for: Callable[[Frame], Optional[QPixmap]],
-                         ink_saver: bool = False, header: bool = True,
-                         indices: Optional[list[int]] = None, marks: bool = False) -> int:
-    """
-    Print the roll on `printer` (paper or PDF). `columns` = the Full-screen column count, paginated;
-    None = one contact sheet with every frame, as on the screen's print views. Returns the page count.
-    """
+@dataclass
+class SheetJob:
+    """Everything that decides how a contact sheet prints or exports."""
+    roll: Roll
+    columns: Optional[int]          # Full-screen column count (paginated); None = one sheet, every frame
+    meta: dict[str, Any]
+    pixmap_for: Callable[[Frame], Optional[QPixmap]]
+    ink_saver: bool = False         # Gallery white instead of Darkroom black
+    header: bool = True
+    indices: Optional[list[int]] = None  # the Show filter, in sheet order
+    marks: bool = False             # grease marks, ratings and notes on the sheet
+    sideways: bool = False          # vertical frames lie sideways, as on 35 mm film
+
+
+def paint_sheet_page(p: QPainter, rect: QRectF, lay: SheetLayout, job: SheetJob, page: int) -> None:
+    """One page of the sheet into `rect` (pixels): header, frames, footer."""
+    shown = job.indices if job.indices is not None else list(job.roll.order)
+    n = len(shown)
+    if job.header:
+        paint_sheet_text(p, rect, lay, job.roll, page, QColor("#000000"), n)
+    first = page * lay.per_page
+    rows_here = math.ceil(min(lay.per_page, n - first) / lay.cols) if n else 0
+    for k in range(rows_here * lay.cols):
+        r, c = divmod(k, lay.cols)
+        cell = QRectF(rect.x() + lay.x0 + c * lay.cell_w, rect.y() + lay.y0 + r * lay.cell_h, lay.cell_w, lay.cell_h)
+        if first + k >= n:
+            p.fillRect(cell, QColor("#FFFFFF") if job.ink_saver else C_FILM)
+        else:
+            i = shown[first + k]
+            fr = job.roll.frames[i]
+            paint_frame_clean(p, cell, lay.rebate_h, job.roll.label(i), job.meta, job.pixmap_for(fr),
+                              job.ink_saver, fr if job.marks else None, job.sideways)
+
+
+def render_contact_sheet(printer: Any, job: SheetJob) -> int:
+    """Print the sheet on `printer` (paper or PDF). Returns the page count."""
     p = QPainter()
     if not p.begin(printer):
         return 0
@@ -2959,27 +3238,129 @@ def render_contact_sheet(printer: Any, roll: Roll, columns: Optional[int], meta:
     # The painter's origin is already the top-left of the printable area (inside the margins).
     paint = printer.pageLayout().paintRectPixels(printer.resolution())
     rect = QRectF(0, 0, paint.width(), paint.height())
-    shown = list(range(len(roll.frames))) if indices is None else indices  # the Show filter
-    n = len(shown)
-    lay = sheet_layout(rect.width(), rect.height(), n, header, columns)
+    n = len(job.indices if job.indices is not None else job.roll.order)
+    lay = sheet_layout(rect.width(), rect.height(), n, job.header, job.columns)
     for page in range(lay.pages):
         if page:
             printer.newPage()
-        if header:
-            paint_sheet_text(p, rect, lay, roll, page, QColor("#000000"), n)
-        first = page * lay.per_page
-        rows_here = math.ceil(min(lay.per_page, n - first) / lay.cols) if n else 0
-        for k in range(rows_here * lay.cols):
-            r, c = divmod(k, lay.cols)
-            cell = QRectF(lay.x0 + c * lay.cell_w, lay.y0 + r * lay.cell_h, lay.cell_w, lay.cell_h)
-            if first + k >= n:
-                p.fillRect(cell, QColor("#FFFFFF") if ink_saver else C_FILM)
-            else:
-                i = shown[first + k]
-                fr = roll.frames[i]
-                paint_frame_clean(p, cell, lay.rebate_h, i, meta, pixmap_for(fr), ink_saver, fr if marks else None)
+        paint_sheet_page(p, rect, lay, job, page)
     p.end()
     return lay.pages
+
+
+EXPORT_SIZES = [(11500, "Archival master — 11,500 px"), (8000, "Large print — 8,000 px"),
+                (5750, "Medium print — 5,750 px"), (4000, "Screen / web — 4,000 px")]
+EXPORT_FORMATS = [("jpg", "JPEG"), ("tif", "TIFF"), ("png", "PNG")]
+
+
+def render_sheet_images(job: SheetJob, paper_in: tuple[float, float], long_px: int,
+                        progress: Optional[Callable[[int, int], bool]] = None) -> list[QImage]:
+    """The sheet as images: `paper_in` (w, h) inches, long edge `long_px`, same layout as the PDF."""
+    pw, ph = paper_in
+    scale = long_px / max(pw, ph)                     # pixels per inch
+    W, H = int(round(pw * scale)), int(round(ph * scale))
+    m = SHEET_MARGIN_IN * scale
+    rect = QRectF(m, m, W - 2 * m, H - 2 * m)
+    n = len(job.indices if job.indices is not None else job.roll.order)
+    lay = sheet_layout(rect.width(), rect.height(), n, job.header, job.columns)
+    pages: list[QImage] = []
+    for page in range(lay.pages):
+        img = QImage(W, H, QImage.Format_RGB888)
+        img.fill(QColor("#FFFFFF"))
+        img.setDotsPerMeterX(int(scale / 0.0254))
+        img.setDotsPerMeterY(int(scale / 0.0254))
+        p = QPainter(img)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+        paint_sheet_page(p, rect, lay, job, page)
+        p.end()
+        pages.append(img)
+        if progress is not None and not progress(page + 1, lay.pages):
+            break
+    return pages
+
+
+def save_sheet_image(img: QImage, path: Path, fmt: str) -> None:
+    """JPEG at 95 without chroma subsampling, LZW-compressed TIFF, or PNG; resolution tag kept."""
+    dpi = img.dotsPerMeterX() * 0.0254
+    if fmt == "png":
+        if not img.save(str(path), "PNG"):
+            raise OSError(f"Couldn't write {path}")
+        return
+    ptr = img.constBits()
+    pil = Image.frombuffer("RGB", (img.width(), img.height()), bytes(ptr), "raw", "RGB", img.bytesPerLine(), 1)
+    if fmt == "tif":
+        pil.save(path, "TIFF", compression="tiff_lzw", dpi=(dpi, dpi))
+    else:
+        pil.save(path, "JPEG", quality=95, subsampling=0, dpi=(dpi, dpi))
+
+
+# ── Exposure tools for the loupe: histogram, clipping warnings, focus highlighting ──
+
+def _qimage_to_pil(img: QImage) -> Image.Image:
+    q = img.convertToFormat(QImage.Format_RGB888)
+    return Image.frombuffer("RGB", (q.width(), q.height()), bytes(q.constBits()), "raw", "RGB", q.bytesPerLine(), 1)
+
+
+def _pil_rgba_to_qimage(im: Image.Image) -> QImage:
+    im = im.convert("RGBA")
+    return QImage(im.tobytes(), im.width, im.height, im.width * 4, QImage.Format_RGBA8888).copy()
+
+
+def exposure_analysis(preview: QImage) -> dict[str, Any]:
+    """Histogram, a clipping overlay (red = blown highlights, blue = blocked shadows) and a focus overlay."""
+    im = _qimage_to_pil(preview)
+    h = im.histogram()
+    hist = {"r": h[0:256], "g": h[256:512], "b": h[512:768], "l": im.convert("L").histogram()}
+    r, g, b = im.split()
+    hi = ImageChops.lighter(ImageChops.lighter(r, g), b).point(lambda v: 255 if v >= 252 else 0)
+    lo = ImageChops.darker(ImageChops.darker(r, g), b).point(lambda v: 255 if v <= 3 else 0)
+    clip = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    clip.paste((255, 40, 40, 210), mask=hi)
+    clip.paste((40, 110, 255, 210), mask=lo)
+    # focus: strong local contrast, measured on a size where film grain doesn't light everything up
+    small = im.convert("L")
+    small.thumbnail((1200, 1200))
+    edges = small.filter(ImageFilter.FIND_EDGES).filter(ImageFilter.MaxFilter(3))
+    eh = edges.histogram()
+    total, acc, cut = sum(eh), 0, 255
+    for v in range(255, -1, -1):  # keep roughly the sharpest 4 % of the picture
+        acc += eh[v]
+        if acc >= total * 0.04:
+            cut = v
+            break
+    cut = max(cut, 40)
+    mask = edges.point(lambda v: 255 if v >= cut else 0)
+    peak = Image.new("RGBA", small.size, (0, 0, 0, 0))
+    peak.paste((70, 255, 90, 230), mask=mask)
+    return {"hist": hist, "clip": _pil_rgba_to_qimage(clip), "peak": _pil_rgba_to_qimage(peak)}
+
+
+def paint_histogram(p: QPainter, box: QRectF, hist: dict[str, list[int]]) -> None:
+    """RGB histogram panel in the bottom-right corner of the loupe."""
+    w = min(280.0, box.width() * 0.32)
+    hgt = w * 0.42
+    panel = QRectF(box.right() - w - 10, box.bottom() - hgt - 10, w, hgt)
+    p.save()
+    p.fillRect(panel, QColor(0, 0, 0, 190))
+    p.setPen(QPen(QColor(255, 255, 255, 60), 1))
+    p.drawRect(panel)
+    inner = panel.adjusted(4, 4, -4, -4)
+    peak = max(1, max(max(hist[k][2:254]) for k in ("r", "g", "b")))
+    p.setCompositionMode(QPainter.CompositionMode_Plus)  # overlapping channels add up to white
+    for key, colour in (("r", QColor(220, 50, 50, 170)), ("g", QColor(50, 200, 70, 170)), ("b", QColor(60, 110, 255, 170))):
+        path = QPainterPath(QPointF(inner.left(), inner.bottom()))
+        for v, count in enumerate(hist[key]):
+            y = inner.bottom() - inner.height() * min(1.0, math.sqrt(count / peak))
+            path.lineTo(QPointF(inner.left() + inner.width() * v / 255, y))
+        path.lineTo(QPointF(inner.right(), inner.bottom()))
+        path.closeSubpath()
+        p.fillPath(path, colour)
+    p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+    for v, colour in ((0, QColor(60, 110, 255)), (255, QColor(255, 60, 60))):  # clipping corners
+        if sum(hist[k][v] for k in ("r", "g", "b")) > 0.002 * sum(hist["l"]):
+            x = inner.left() if v == 0 else inner.right() - 8
+            p.fillRect(QRectF(x, inner.top(), 8, 8), colour)
+    p.restore()
 
 
 class LoupeOverlay(QWidget):
@@ -3089,6 +3470,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
 
     toolChanged = Signal(str)
     marksChanged = Signal(int)
+    orderChanged = Signal()  # frame order / hidden frames changed (numbers change too)
+    exposureToggle = Signal(str)  # H / J / F pressed: histogram, clipping, peaking
     compareChanged = Signal(bool)
     status = Signal(str)
     brushChanged = Signal(float, str)
@@ -3136,6 +3519,9 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._pos: dict[int, int] = {}    # frame index -> position on the sheet
         self._kbd_nav = False             # last frame choice came from the keyboard
         self._overlay: Optional["LoupeOverlay"] = None  # draws the 60% / 95% views over the whole window
+        self._move_drag: Optional[dict[str, int]] = None  # Ctrl+drag of a frame to a new place
+        self.show_hist = self.show_clip = self.show_peak = False  # exposure tools in the loupe
+        self._expo: "OrderedDict[tuple, dict[str, Any]]" = OrderedDict()
         self._press: Optional[dict[str, Any]] = None  # a press waiting to be a click (zoom) or a drag (draw)
         self._pix_cache: "OrderedDict[Path, QPixmap]" = OrderedDict()
 
@@ -3268,7 +3654,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._rotate(idx, steps)
         self._record(("rotate", idx, steps))
         self.selected = idx
-        self.status.emit(f"Frame {idx + 1}A rotated {'clockwise' if steps > 0 else 'counter-clockwise'}"
+        self.status.emit(f"Frame {self.roll.label(idx)} rotated {'clockwise' if steps > 0 else 'counter-clockwise'}"
                          "  (display only; the file is unchanged)")
         self.marksChanged.emit(idx)
         self.viewport().update()
@@ -3297,8 +3683,70 @@ class ContactSheetCanvas(QAbstractScrollArea):
         return int(self.viewport().height() * 0.6) if self.compare else 0
 
     def _refresh_order(self) -> None:
-        self.order = [i for i, fr in enumerate(self.frames) if frame_passes(fr, self.filter)]
+        hidden = self.roll.hidden
+        if self.filter == "hidden":
+            self.order = [i for i in self.roll.order if i in hidden]
+        else:
+            self.order = [i for i in self.roll.order if i not in hidden and frame_passes(self.frames[i], self.filter)]
         self._pos = {i: k for k, i in enumerate(self.order)}
+
+    # ── frame order: move / reverse / sort / hide (all undoable) ────────────
+    def _set_order(self, order: list[int], hidden: set[int], message: str) -> None:
+        before = (list(self.roll.order), set(self.roll.hidden))
+        if before == (order, hidden):
+            return
+        self.roll.order, self.roll.hidden = list(order), set(hidden)
+        self._record(("order", -1, before, (list(order), set(hidden))))
+        self._order_changed(message)
+
+    def _order_changed(self, message: str = "") -> None:
+        self.roll.save_info()
+        self._update_scrollbar()
+        self.orderChanged.emit()
+        if message:
+            self.status.emit(message)
+        self.viewport().update()
+
+    def move_frame(self, delta: int) -> None:
+        idx = self._target_frame()
+        if idx < 0 or idx in self.roll.hidden:
+            return
+        order = list(self.roll.order)
+        visible = [i for i in order if i not in self.roll.hidden]
+        k = visible.index(idx)
+        dest = min(len(visible) - 1, max(0, k + delta))
+        if dest == k:
+            return
+        self.move_frame_to(idx, visible[dest])
+
+    def move_frame_to(self, idx: int, target: int) -> None:
+        """Put frame `idx` where frame `target` is (the others shift along)."""
+        if idx == target:
+            return
+        order = list(self.roll.order)
+        order.remove(idx)
+        t = order.index(target)
+        if self.roll.order.index(idx) < self.roll.order.index(target):
+            t += 1
+        order.insert(t, idx)
+        self.selected = idx
+        self._set_order(order, self.roll.hidden, f"{self.frames[idx].name} moved")
+
+    def reverse_order(self) -> None:
+        self._set_order(list(reversed(self.roll.order)), self.roll.hidden, "Frame order reversed")
+
+    def sort_by_name(self) -> None:
+        order = sorted(self.roll.order, key=lambda i: natural_key(self.frames[i].name))
+        self._set_order(order, self.roll.hidden, "Frames sorted by file name")
+
+    def toggle_hidden(self) -> None:
+        idx = self._target_frame()
+        if idx < 0:
+            return
+        hidden = set(self.roll.hidden)
+        hidden.symmetric_difference_update({idx})
+        word = "hidden from the sheet (Show ▸ Hidden frames to bring it back)" if idx in hidden else "back on the sheet"
+        self._set_order(self.roll.order, hidden, f"{self.frames[idx].name} {word}")
 
     def set_filter(self, key: str) -> None:
         self.filter = key if key in FILTER_NAMES else "all"
@@ -3468,6 +3916,22 @@ class ContactSheetCanvas(QAbstractScrollArea):
         i = self.cell_at(pos)
         return (i, self._image_rect(i)) if i >= 0 else None
 
+    def _exposure(self, fr: Frame) -> dict[str, Any]:
+        key = (fr.path, fr.rotation)
+        info = self._expo.get(key)
+        if info is None:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                info = exposure_analysis(fr.preview)
+            finally:
+                QApplication.restoreOverrideCursor()
+            self._expo[key] = info
+            while len(self._expo) > 12:
+                self._expo.popitem(last=False)
+        else:
+            self._expo.move_to_end(key)
+        return info
+
     def preview_pixmap(self, fr: Frame) -> Optional[QPixmap]:
         if fr.preview is None:
             return fr.thumb
@@ -3538,8 +4002,14 @@ class ContactSheetCanvas(QAbstractScrollArea):
         elif kind == "frame":
             fr = self.frames[idx]
             fr.user_rating, fr.note = op[2] if undo else op[3]
+        elif kind == "label":
+            self.frames[idx].label = op[2] if undo else op[3]
         elif kind == "rotate":
             self._rotate(idx, -op[2] if undo else op[2])
+        elif kind == "order":
+            order, hidden = op[2] if undo else op[3]
+            self.roll.order, self.roll.hidden = list(order), set(hidden)
+            self._order_changed()
         return idx
 
     def undo(self) -> None:
@@ -3549,7 +4019,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
         op = self.undo_ops.pop()
         idx = self._apply_op(op, undo=True)
         self.redo_ops.append(op)
-        self.marksChanged.emit(idx)
+        if idx >= 0:
+            self.marksChanged.emit(idx)
         self.viewport().update()
 
     def redo(self) -> None:
@@ -3559,7 +4030,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
         op = self.redo_ops.pop()
         idx = self._apply_op(op, undo=False)
         self.undo_ops.append(op)
-        self.marksChanged.emit(idx)
+        if idx >= 0:
+            self.marksChanged.emit(idx)
         self.viewport().update()
 
     # ── culling: current frame, ratings, rejects, notes ─────────────────────
@@ -3584,11 +4056,25 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.marksChanged.emit(idx)
         self.viewport().update()
 
+    def set_label(self, name: str) -> None:
+        """Colour label on the frame (the same colour again removes it)."""
+        idx = self._target_frame()
+        if idx < 0:
+            return
+        fr = self.frames[idx]
+        before, after = fr.label, ("" if fr.label == name else name)
+        fr.label = after
+        self._record(("label", idx, before, after))
+        self.selected = idx
+        self.marksChanged.emit(idx)
+        self.status.emit(f"Frame {self.roll.label(idx)}: " + (f"{after} label" if after else "label removed"))
+        self.viewport().update()
+
     def set_rating(self, value: Optional[int]) -> None:
         idx = self._target_frame()
         if idx >= 0:
             self._set_frame_state(idx, value, self.frames[idx].note)
-            self.status.emit(f"Frame {idx + 1}A: " + ("rating cleared" if value is None else f"{value} ★"))
+            self.status.emit(f"Frame {self.roll.label(idx)}: " + ("rating cleared" if value is None else f"{value} ★"))
 
     def toggle_reject(self) -> None:
         idx = self._target_frame()
@@ -3616,7 +4102,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
             return
         fr = self.frames[idx]
         text, ok = QInputDialog.getMultiLineText(
-            self, f"Note — frame {idx + 1}A", f"Darkroom note for {fr.name}\n(e.g. grade 3, +½ stop, dodge the sky):",
+            self, f"Note — frame {self.roll.label(idx)}", f"Darkroom note for {fr.name}\n(e.g. grade 3, +½ stop, dodge the sky):",
             fr.note)
         if ok:
             self._set_frame_state(idx, fr.user_rating, text.strip())
@@ -3649,7 +4135,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         elif cell.bottom() > bottom:
             sb.setValue(int(sb.value() + (cell.bottom() - bottom)))
         fr = self.frames[self.selected]
-        self.status.emit(f"Frame {self.selected + 1}A  {fr.name}" + (f"   {fr.rating} ★" if fr.rating > 0 else ""))
+        self.status.emit(f"Frame {self.roll.label(self.selected)}  {fr.name}" + (f"   {fr.rating} ★" if fr.rating > 0 else ""))
         self.viewport().update()
 
     def _marks_with_drag(self, idx: int) -> list[Mark]:
@@ -3757,6 +4243,9 @@ class ContactSheetCanvas(QAbstractScrollArea):
         if self.compare and i == self.compare_a:
             p.setPen(QPen(C_AMBER, 2))
             p.drawRect(cell.adjusted(1, 1, -1, -1))
+        elif self._move_drag is not None and i == self._move_drag["target"] and i != self._move_drag["idx"]:
+            p.setPen(QPen(C_AMBER, 4))  # where a Ctrl+dragged frame will go
+            p.drawRect(cell.adjusted(2, 2, -2, -2))
         elif i == self.selected:  # current frame (keyboard culling acts on it)
             p.setPen(QPen(C_AMBER, 2.5))
             p.drawRect(cell.adjusted(1.5, 1.5, -1.5, -1.5))
@@ -3766,7 +4255,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         p.restore()
 
     def _paint_rebate(self, p: QPainter, i: int, cell: QRectF) -> None:
-        paint_rebate_strip(p, cell, self.rebate_h, f"{i + 1}A", self.roll_film_meta())
+        paint_rebate_strip(p, cell, self.rebate_h, self.roll.label(i), self.roll_film_meta())
 
     def roll_film_meta(self) -> dict[str, Any]:
         return self._film_lookup(self.roll.film)
@@ -3789,10 +4278,18 @@ class ContactSheetCanvas(QAbstractScrollArea):
         for mk in self._marks_with_drag(idx):
             draw_mark(p, mk, img, width)
         self._paint_selection(p, idx, img)
+        if (self.show_hist or self.show_clip or self.show_peak) and fr.preview is not None:
+            info = self._exposure(fr)
+            if self.show_clip:
+                p.drawImage(img, info["clip"])
+            if self.show_peak:
+                p.drawImage(img, info["peak"])
+            if self.show_hist:
+                paint_histogram(p, box, info["hist"])
         paint_frame_badges(p, box, img.intersected(box), fr)
         p.setClipping(False)
         size = f"{round(min(self.mag, LOUPE_FIT) * 100)}%" if locked else f"{round(LOUPE_HOVER * 100)}%"
-        label = f"{idx + 1}A  {fr.name}   {size}" + (f"  ·  {self.zoom * 100:.0f}%" if self.zoom > 1.0 else "")
+        label = f"{self.roll.label(idx)}  {fr.name}   {size}" + (f"  ·  {self.zoom * 100:.0f}%" if self.zoom > 1.0 else "")
         p.setFont(QFont("DejaVu Sans Mono", 9))
         p.fillRect(QRectF(box.x(), box.y(), QFontMetrics(p.font()).horizontalAdvance(label) + 14, 20),
                    QColor(0, 0, 0, 200))
@@ -3820,7 +4317,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
                     p.drawPixmap(img, pm, QRectF(pm.rect()))
                 for mk in fr.marks:
                     draw_mark(p, mk, img, max(1.8, img.width() * 0.008))
-                label = f"[{tag}]  {idx + 1}A  {fr.name}"
+                label = f"[{tag}]  {self.roll.label(idx)}  {fr.name}"
             else:
                 p.setPen(QColor("#777777"))
                 p.drawText(box, Qt.AlignCenter, "Hover a frame in the grid below for [B]")
@@ -3860,6 +4357,13 @@ class ContactSheetCanvas(QAbstractScrollArea):
             self.viewport().update()
             return
         if e.button() != Qt.LeftButton:
+            return
+        if e.modifiers() & Qt.ControlModifier and not self.loupe_locked and not self.compare:
+            i = self.cell_at(pos)
+            if i >= 0 and self.filter != "hidden":  # Ctrl+drag: move this frame to another place
+                self._move_drag = {"idx": i, "target": i}
+                self.viewport().setCursor(Qt.ClosedHandCursor)
+                self.viewport().update()
             return
         if self.compare:
             i = self.cell_at(pos)
@@ -3923,6 +4427,12 @@ class ContactSheetCanvas(QAbstractScrollArea):
 
     def mouseMoveEvent(self, e) -> None:  # noqa: N802
         pos = e.position()
+        if self._move_drag is not None:
+            t = self.cell_at(pos)
+            if t >= 0:
+                self._move_drag["target"] = t
+            self.viewport().update()
+            return
         if (pos - self.hover_pos).manhattanLength() > 2:
             self._kbd_nav = False
         self.hover_pos = QPointF(pos)
@@ -3999,6 +4509,12 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.viewport().update()
 
     def mouseReleaseEvent(self, e) -> None:  # noqa: N802
+        if self._move_drag is not None and e.button() == Qt.LeftButton:
+            move, self._move_drag = self._move_drag, None
+            self.move_frame_to(move["idx"], move["target"])
+            self._update_cursor(e.position())
+            self.viewport().update()
+            return
         if e.button() == Qt.LeftButton and self._press is not None:
             press, self._press = self._press, None
             self._toggle_zoom(press)
@@ -4108,6 +4624,10 @@ class ContactSheetCanvas(QAbstractScrollArea):
         if mods & Qt.AltModifier and Qt.Key_1 <= key <= Qt.Key_4:
             self.set_brush_color(BRUSH_COLORS[key - Qt.Key_1][1])
             return
+        if mods & Qt.AltModifier and key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down):
+            step = {Qt.Key_Left: -1, Qt.Key_Right: 1, Qt.Key_Up: -self.columns, Qt.Key_Down: self.columns}[key]
+            self.move_frame(step)  # Alt+arrows: move the frame itself
+            return
         if self._sel_valid() and self.sel is not None:
             fi, sel_mark = self.sel
             if key in (Qt.Key_Delete, Qt.Key_Backspace):
@@ -4126,7 +4646,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
             idx = self._target_frame()
             if idx >= 0 and self.frames[idx].marks:
                 self._remove_mark(idx, self.frames[idx].marks[-1])
-                self.status.emit(f"Frame {idx + 1}A: newest mark removed  "
+                self.status.emit(f"Frame {self.roll.label(idx)}: newest mark removed  "
                                  f"({len(self.frames[idx].marks)} left; Ctrl+Z brings it back)")
             return
         if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Home, Qt.Key_End):
@@ -4135,8 +4655,14 @@ class ContactSheetCanvas(QAbstractScrollArea):
         if key == Qt.Key_X and mods & Qt.ShiftModifier:
             self.toggle_reject()
             return
+        if text in ("6", "7", "8", "9"):  # colour labels, as in Lightroom
+            self.set_label({"6": "red", "7": "yellow", "8": "green", "9": "blue"}[text])
+            return
         if text in ("0", "1", "2", "3", "4", "5"):
             self.set_rating(None if text == "0" else int(text))
+            return
+        if text.lower() in ("h", "j", "f") and not mods & Qt.ShiftModifier:
+            self.exposureToggle.emit({"h": "histogram", "j": "clipping", "f": "peaking"}[text.lower()])
             return
         if text in ("n", "N"):
             self.edit_note()
@@ -4200,6 +4726,11 @@ class RollPage(QWidget):
         super().__init__(parent)
         self.cfg = cfg
         self.roll = Roll(folder, film, camera, lens)
+        guess_date, guess_film = parse_folder_info(folder.name, [f["name"] for f in cfg.films])
+        if not self.roll.film:  # no film saved for this roll: the folder name, else your default film
+            self.roll.film = guess_film or cfg.profile.get("film", "")
+        if not self.roll.shot_date:
+            self.roll.shot_date = guess_date
         self.roll.load_sidecar_marks()
         if marks or extras:
             self.roll.apply_marks(marks or {}, extras)
@@ -4223,17 +4754,19 @@ class RollPage(QWidget):
         self.info = QLabel("")
         head = QHBoxLayout()
         head.setContentsMargins(10, 6, 10, 6)
-        title = QLabel(f"ROLL  {folder.name}")
-        title.setObjectName("amber")
-        head.addWidget(title)
+        self.title_label = QLabel(f"ROLL  {self.roll.display_title}")
+        self.title_label.setObjectName("amber")
+        head.addWidget(self.title_label)
         for label, combo in (("Film", self.film_combo), ("Camera", self.camera_combo), ("Lens", self.lens_combo)):
             head.addSpacing(10)
             head.addWidget(QLabel(label))
             head.addWidget(combo)
         head.addStretch(1)
-        self.notes_button = QPushButton("✎ Roll Notes")
-        self.notes_button.setToolTip("Notes for the whole roll (development, paper, ideas); printed in the sheet header")
+        self.notes_button = QPushButton("✎ Roll Info")
+        self.notes_button.setToolTip("Title, shot date, lab, keywords and notes for this roll.\n"
+                                     "Printed in the sheet header; keywords and lab also sync to RapidRAW / .xmp")
         self.notes_button.clicked.connect(self.edit_note)
+        self._mark_info_button()
         head.addWidget(self.notes_button)
         head.addSpacing(10)
         head.addWidget(self.info)
@@ -4252,6 +4785,8 @@ class RollPage(QWidget):
         self._sync_timer.setInterval(1200)
         self._sync_timer.timeout.connect(self.flush_sync)
         self.canvas.marksChanged.connect(self._on_marks_changed)
+        self.canvas.orderChanged.connect(self.dirty.emit)
+        self.extra_loaders: list[ImageLoaderThread] = []
         self.refresh_equipment()
         for combo in (self.film_combo, self.camera_combo, self.lens_combo):
             combo.activated.connect(self._equipment_changed)
@@ -4344,7 +4879,9 @@ class RollPage(QWidget):
         prof = self.cfg.profile
         return SyncJob(fr.path, [m.to_dict() for m in fr.marks], fr.rating, prof.get("artist", ""),
                        prof.get("copyright", ""), self.roll.camera, self.roll.lens,
-                       int(self.cfg.film_meta(self.roll.film).get("iso", 400)), self.roll.film, fr.extras())
+                       int(self.cfg.film_meta(self.roll.film).get("iso", 400)), self.roll.film, fr.extras(),
+                       {"title": self.roll.display_title, "shot_date": self.roll.shot_date, "lab": self.roll.lab,
+                        "keywords": list(self.roll.keywords)})
 
     def flush_sync(self, everything: bool = False) -> None:
         """Sync the changed frames now (or every frame)."""
@@ -4359,20 +4896,50 @@ class RollPage(QWidget):
         return {"folder": str(self.roll.folder), "film": self.roll.film, "camera": self.roll.camera,
                 "lens": self.roll.lens, "marks": self.roll.marks_table(), "extras": self.roll.extras_table()}
 
+    def _mark_info_button(self) -> None:
+        r = self.roll
+        filled = bool(r.title or r.lab or r.note or r.keywords)
+        self.notes_button.setText("✎ Roll Info •" if filled else "✎ Roll Info")
+
     def edit_note(self) -> None:
-        text, ok = QInputDialog.getMultiLineText(
-            self, f"Roll notes — {self.roll.folder.name}",
-            "Notes for this roll (developer, time, temperature, paper, printing ideas…):", self.roll.note)
-        if ok:
-            self.roll.note = text.strip()
-            self.roll.save_note()
-            self.notes_button.setText("✎ Roll Notes •" if self.roll.note else "✎ Roll Notes")
-            self.canvas.viewport().update()
-            self.dirty.emit()
+        dlg = RollInfoDialog(self.roll, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.roll.save_info()
+        self.title_label.setText(f"ROLL  {self.roll.display_title}")
+        self._mark_info_button()
+        self.canvas.viewport().update()
+        # keywords, lab and title travel to the sidecars of every frame
+        self._sync_dirty.update(range(len(self.roll.frames)))
+        self._schedule_sync()
+        self.dirty.emit()
+
+    edit_info = edit_note
+
+    def add_photos(self, paths: list[Path]) -> int:
+        """Add photos (from any folder) to the end of this roll; returns how many were new."""
+        new = self.roll.add_files(paths)
+        if not new:
+            return 0
+        self.roll.save_info()
+        loader = ImageLoaderThread([self.roll.frames[i].path for i in new], self, first=new[0])
+        loader.frameReady.connect(self.canvas.on_frame_ready)
+        loader.frameFailed.connect(self._on_frame_failed)
+        loader.progress.connect(self._on_progress)
+        self.extra_loaders.append(loader)
+        loader.start()
+        self.canvas._update_scrollbar()
+        self.canvas.viewport().update()
+        self.dirty.emit()
+        return len(new)
+
+    def loading(self) -> bool:
+        return self.loader.isRunning() or any(x.isRunning() for x in self.extra_loaders)
 
     def shutdown(self) -> None:
-        self.loader.stop()
-        self.loader.wait()  # stops after the current file; a QThread destroyed while running aborts the app
+        for loader in [self.loader] + self.extra_loaders:
+            loader.stop()
+            loader.wait()  # stops after the current file; a QThread destroyed while running aborts the app
 
 
 KEYS_TEXT = (
@@ -4392,7 +4959,13 @@ KEYS_TEXT = (
     "CULLING  (acts on the frame under the mouse, or the highlighted one after arrow keys)\n"
     "Arrow keys / Home / End  Move between frames     1-5  Rate     0  Clear rating\n"
     "Shift+X  Reject / un-reject     N  Frame note     Ctrl+] / Ctrl+[  Rotate     Space  Enlarge\n"
-    "Star colours rate too: green 5, red 5, yellow 4, silver 3 (Settings ▸ Files & Sync)\n\n"
+    "Star colours rate too: green 5, red 5, yellow 4, silver 3 (Settings ▸ Files & Sync)\n"
+    "6 / 7 / 8 / 9  Colour label red / yellow / green / blue (again removes it; purple in Frame ▸ Colour Label)\n\n"
+    "FRAME ORDER\n"
+    "Ctrl+drag a frame  Move it     Alt+arrows  Move the frame     Ctrl+Shift+H  Hide / show on the sheet\n"
+    "Frame menu: reverse, sort by name, add photos (or drop files on the window)     Ctrl+I  Roll Info\n\n"
+    "EXPOSURE (in the 60% / 95% loupe)\n"
+    "H  Histogram     J  Clipping warnings     F  Focus highlighting\n\n"
     "VIEWING  (the same in Loupe and Mark mode)\n"
     "Hover  60% view beside the frame     Click (or double-click)  60% / 95%     Esc  Back\n"
     "Wheel  Grow the view to 95%, then magnify the photo to 200% (stops at 75 / 95 / 150 / 200%)\n"
@@ -4401,7 +4974,8 @@ KEYS_TEXT = (
     "C  2-up compare (hover for [B]); C or Esc exits\n\n"
     "UNDO\nCtrl+Z / ↶ Undo     Ctrl+Shift+Z / ↷ Redo\n"
     "Delete  Remove the selected mark, or the newest mark on the photo under the cursor\n\n"
-    "FILE\nCtrl+O Import   Ctrl+P Print   Ctrl+Shift+E PDF   Ctrl+Shift+S Export selects   Ctrl+S Sync Data\n"
+    "FILE\nCtrl+O Import   Ctrl+P Print   Ctrl+Shift+E PDF   Ctrl+Alt+E Image   Ctrl+Shift+S Export selects\n"
+    "Ctrl+S Sync Data   Drop folders or photos on the window to open / add them\n"
     "Ctrl+, Settings   F11 Full screen")
 
 
@@ -4438,6 +5012,7 @@ class MainWindow(QMainWindow):
         self.brush_style = DEFAULT_PEN
         self.view = "full"
         self._windows: dict[str, QDialog] = {}  # open non-blocking dialogs by kind
+        self.setAcceptDrops(True)
         self._build_actions()
 
         self.autosave = QTimer(self)
@@ -4470,6 +5045,8 @@ class MainWindow(QMainWindow):
         m_file.addSeparator()
         self._act(m_file, "Print Contact Sheet…", self.print_sheet, "Ctrl+P")
         self._act(m_file, "Export Contact Sheet as PDF…", self.export_pdf, "Ctrl+Shift+E")
+        self._act(m_file, "Export Contact Sheet as Image…", self.export_image, "Ctrl+Alt+E")
+        self._act(m_file, "Open Export Folder", self.open_export_folder)
         self._act(m_file, "Export Selects…", self.export_selects, "Ctrl+Shift+S")
         m_file.addSeparator()
         self._act(m_file, "Sync Data", self.sync_all, "Ctrl+S")
@@ -4486,9 +5063,23 @@ class MainWindow(QMainWindow):
             m_frame.addAction(f"Rate {'★' * n}\t{n}").triggered.connect(lambda _c=False, v=n: self._canvas_call("set_rating", v))
         m_frame.addAction("Clear Rating\t0").triggered.connect(lambda _c=False: self._canvas_call("set_rating", None))
         m_frame.addAction("Reject / Un-reject\tShift+X").triggered.connect(lambda _c=False: self._canvas_call("toggle_reject"))
+        m_label = m_frame.addMenu("Colour Label")
+        for key, (name, colour) in zip(("6", "7", "8", "9", ""), LABEL_COLORS.items()):
+            pm_ = QPixmap(14, 14)
+            pm_.fill(QColor(colour))
+            act = m_label.addAction(QIcon(pm_), name.capitalize() + (f"\t{key}" if key else ""))
+            act.triggered.connect(lambda _c=False, n=name: self._canvas_call("set_label", n))
         m_frame.addSeparator()
         m_frame.addAction("Edit Frame Note…\tN").triggered.connect(lambda _c=False: self._canvas_call("edit_note"))
-        self._act(m_frame, "Edit Roll Notes…", self.edit_roll_note)
+        self._act(m_frame, "Roll Info…", self.edit_roll_note, "Ctrl+I")
+        m_frame.addSeparator()
+        m_frame.addAction("Move Frame Earlier\tAlt+←").triggered.connect(lambda _c=False: self._canvas_call("move_frame", -1))
+        m_frame.addAction("Move Frame Later\tAlt+→").triggered.connect(lambda _c=False: self._canvas_call("move_frame", 1))
+        m_frame.addAction("(or Ctrl+drag a frame to a new place)").setEnabled(False)
+        m_frame.addAction("Reverse Frame Order").triggered.connect(lambda _c=False: self._canvas_call("reverse_order"))
+        m_frame.addAction("Sort Frames by File Name").triggered.connect(lambda _c=False: self._canvas_call("sort_by_name"))
+        self._act(m_frame, "Hide / Show Frame on the Sheet", lambda: self._canvas_call("toggle_hidden"), "Ctrl+Shift+H")
+        self._act(m_frame, "Add Photos to This Roll…", self.add_photos, "Ctrl+Shift+O")
         m_frame.addSeparator()
         self._act(m_frame, "Rotate Clockwise", lambda: self._canvas_call("rotate_frame", 1), "Ctrl+]")
         self._act(m_frame, "Rotate Counter-clockwise", lambda: self._canvas_call("rotate_frame", -1), "Ctrl+[")
@@ -4496,6 +5087,16 @@ class MainWindow(QMainWindow):
         m_frame.addAction("Next / Previous Frame\tArrow keys").setEnabled(False)
         m_view = mb.addMenu("&View")
         self._act(m_view, "Full Screen (F11) / Exit Full Screen", self.toggle_fullscreen, "F11")
+        m_view.addSeparator()
+        self.expo_actions: dict[str, QAction] = {}
+        for key, label, hint in (("histogram", "Histogram in the Loupe", "H"),
+                                 ("clipping", "Clipping Warnings (red highlights, blue shadows)", "J"),
+                                 ("peaking", "Focus Highlighting", "F")):
+            act = m_view.addAction(f"{label}\t{hint}")
+            act.setCheckable(True)
+            act.setChecked(bool(self.cfg.setting(key)))
+            act.toggled.connect(lambda on, k=key: self.set_exposure_tool(k, on))
+            self.expo_actions[key] = act
         m_eq = mb.addMenu("&Equipment")
         self._act(m_eq, "Equipment Inventory…", self.open_equipment, "Ctrl+E")
         self._act(m_eq, "User Profile && Defaults…", self.open_profile, "Ctrl+Shift+P")
@@ -4721,6 +5322,8 @@ class MainWindow(QMainWindow):
         page.openEquipment.connect(self.open_equipment)
         page.canvas.compareChanged.connect(self._canvas_compare_changed)
         page.canvas.status.connect(lambda m: self.statusBar().showMessage(m, 5000))
+        page.canvas.exposureToggle.connect(lambda k: self.expo_actions[k].toggle())
+        self._apply_exposure(page.canvas)
         page.syncJobs.connect(self._forward_jobs)
         page.dirty.connect(self.mark_dirty)
         page.dirty.connect(self._update_sync_label)
@@ -4792,6 +5395,52 @@ class MainWindow(QMainWindow):
         for page in self.pages():
             page.canvas.set_filter(key)
         self.mark_dirty()
+
+    def set_exposure_tool(self, key: str, on: bool) -> None:
+        self.cfg.set_setting(key, on)
+        self.cfg.save()
+        for page in self.pages():
+            self._apply_exposure(page.canvas)
+        names = {"histogram": "Histogram", "clipping": "Clipping warnings", "peaking": "Focus highlighting"}
+        self.statusBar().showMessage(f"{names[key]} {'on' if on else 'off'} (shows in the 60% / 95% loupe)", 4000)
+
+    def _apply_exposure(self, canvas: "ContactSheetCanvas") -> None:
+        canvas.show_hist = bool(self.cfg.setting("histogram"))
+        canvas.show_clip = bool(self.cfg.setting("clipping"))
+        canvas.show_peak = bool(self.cfg.setting("peaking"))
+        canvas.viewport().update()
+
+    def add_photos(self, paths: Optional[list[Path]] = None) -> None:
+        page = self.current_page()
+        if page is None:
+            self.statusBar().showMessage("Import a roll first.", 4000)
+            return
+        if paths is None:
+            files, _ = QFileDialog.getOpenFileNames(
+                self, "Add Photos to This Roll", str(page.roll.folder),
+                "Images (" + " ".join(f"*{e}" for e in sorted(ALL_EXTS)) + ")")
+            paths = [Path(f) for f in files]
+        n = page.add_photos(paths)
+        self.statusBar().showMessage(f"Added {n} photo(s) to {page.roll.display_title}" if n else
+                                     "Those photos are already in this roll.", 5000)
+
+    # drag and drop: folders open as rolls, image files join the current roll
+    def dragEnterEvent(self, e) -> None:  # noqa: N802
+        if e.mimeData().hasUrls() and any(u.isLocalFile() for u in e.mimeData().urls()):
+            e.acceptProposedAction()
+
+    def dropEvent(self, e) -> None:  # noqa: N802
+        paths = [Path(u.toLocalFile()) for u in e.mimeData().urls() if u.isLocalFile()]
+        folders = [x for x in paths if x.is_dir()]
+        files = [x for x in paths if x.is_file() and x.suffix.lower() in ALL_EXTS]
+        for folder in folders:
+            self.open_roll(folder)
+        if files:
+            if self.current_page() is not None and not folders:
+                self.add_photos(files)
+            else:
+                self.open_roll(files[0].parent)
+        e.acceptProposedAction()
 
     def edit_roll_note(self) -> None:
         page = self.current_page()
@@ -4866,7 +5515,7 @@ class MainWindow(QMainWindow):
                   extras: Optional[dict[str, dict[str, Any]]] = None) -> Optional[RollPage]:
         prof = self.cfg.profile
         try:
-            page = RollPage(self.cfg, folder, camera or prof.get("camera", ""), film or prof.get("film", ""),
+            page = RollPage(self.cfg, folder, camera or prof.get("camera", ""), film,
                             lens or prof.get("lens", ""), marks, int(self.cfg.setting("default_columns")), self.view,
                             self.tool, self._hover_loupe_on(), extras=extras)
         except OSError as exc:
@@ -5110,6 +5759,7 @@ class MainWindow(QMainWindow):
         self.sync_worker.rapidraw_exif = bool(c.setting("rapidraw_exif"))
         self.sync_worker.xmp_sync = bool(c.setting("xmp_sync"))
         self.set_sync_mode(str(c.setting("sync_mode")))
+        NUMBERING.update(style=str(c.setting("number_style")), start=int(c.setting("number_start")))
         STAR_RATINGS.clear()
         STAR_RATINGS.update(DEFAULT_STAR_RATINGS)
         STAR_RATINGS.update({str(k).upper(): int(v) for k, v in (c.setting("star_ratings") or {}).items()})
@@ -5154,15 +5804,17 @@ class MainWindow(QMainWindow):
         printer.setDocName(f"{APP_NAME} – {page.roll.folder.name}")
         return printer
 
+    def _sheet_job(self, page: RollPage, pixmap_for: Optional[Callable[[Frame], Optional[QPixmap]]] = None) -> SheetJob:
+        c = self.cfg
+        return SheetJob(page.roll, None if page.canvas.view in PAPER_INCHES else page.canvas.columns,
+                        c.film_meta(page.roll.film), pixmap_for or page.canvas.preview_pixmap,
+                        bool(c.setting("print_ink_saver")), bool(c.setting("print_header")),
+                        list(page.canvas.order), bool(c.setting("print_marks")), bool(c.setting("sideways_verticals")))
+
     def _print_roll(self, page: RollPage, printer: Any) -> None:
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            pages = render_contact_sheet(
-                printer, page.roll, None if page.canvas.view in PAPER_INCHES else page.canvas.columns,
-                self.cfg.film_meta(page.roll.film),
-                page.canvas.preview_pixmap, bool(self.cfg.setting("print_ink_saver")),
-                bool(self.cfg.setting("print_header")), list(page.canvas.order),
-                bool(self.cfg.setting("print_marks")))
+            pages = render_contact_sheet(printer, self._sheet_job(page))
         finally:
             QApplication.restoreOverrideCursor()
         self.statusBar().showMessage(f"Contact sheet sent: {pages} page(s)." if pages else
@@ -5180,7 +5832,7 @@ class MainWindow(QMainWindow):
         if not page.canvas.order:
             self.statusBar().showMessage("No frames match the Show filter.", 4000)
             return None
-        if page.loader.isRunning() and QMessageBox.question(
+        if page.loading() and QMessageBox.question(
                 self, "Print", "Some frames are still loading. Print anyway?") != QMessageBox.Yes:
             return None
         return page
@@ -5197,14 +5849,123 @@ class MainWindow(QMainWindow):
                 return
         self._print_roll(page, printer)
 
+    # ── exporting: where files go ────────────────────────────────────────────
+    def _export_folder(self, page: RollPage) -> Path:
+        if self.cfg.setting("export_mode") == "folder":
+            return Path(str(self.cfg.setting("export_folder"))).expanduser()
+        last = self.cfg.data.get("last_export_folder")
+        return Path(last) if last and Path(last).is_dir() else page.roll.folder
+
+    def _export_path(self, page: RollPage, filename: str, title: str, file_filter: str) -> Optional[Path]:
+        """Settings ▸ Printing & Export: straight into the contact sheets folder, or ask (last folder first)."""
+        folder = self._export_folder(page)
+        if self.cfg.setting("export_mode") == "folder":
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                QMessageBox.warning(self, title, f"Can't use the contact sheets folder:\n{folder}\n\n{exc}")
+                return None
+            target, n = folder / filename, 2
+            while target.exists():  # never overwrite an earlier export
+                target = folder / f"{Path(filename).stem} ({n}){Path(filename).suffix}"
+                n += 1
+            return target
+        path, _ = QFileDialog.getSaveFileName(self, title, str(folder / filename), file_filter)
+        if not path:
+            return None
+        self.cfg.data["last_export_folder"] = str(Path(path).parent)
+        self.cfg.save()
+        return Path(path)
+
+    def _sheet_filename(self, page: RollPage, ext: str) -> str:
+        safe = re.sub(r'[\\/:*?"<>|]+', "_", page.roll.display_title).strip() or "roll"
+        return f"{safe}_contact_sheet.{ext}"
+
+    def _exported(self, paths: list[Path], what: str) -> None:
+        self.cfg.data["last_export_dir_used"] = str(paths[0].parent)
+        self.cfg.save()
+        box = QMessageBox(QMessageBox.Information, what,
+                          f"Saved {len(paths)} file(s) to\n{paths[0].parent}\n\n" + "\n".join(p.name for p in paths[:6]),
+                          QMessageBox.Close, self)
+        open_btn = box.addButton("Open Folder", QMessageBox.ActionRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(paths[0].parent)))
+
+    def open_export_folder(self) -> None:
+        last = self.cfg.data.get("last_export_dir_used")
+        folder = Path(last) if last else Path(str(self.cfg.setting("export_folder"))).expanduser()
+        if self.cfg.setting("export_mode") == "folder":
+            folder = Path(str(self.cfg.setting("export_folder"))).expanduser()
+        if folder.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        else:
+            self.statusBar().showMessage(f"Nothing exported yet ({folder} doesn't exist).", 5000)
+
     def export_pdf(self) -> None:
         page = self._printable_page()
         if page is None:
             return
-        default = str(page.roll.folder / f"{page.roll.folder.name}_contact_sheet.pdf")
-        path, _ = QFileDialog.getSaveFileName(self, "Export Contact Sheet as PDF", default, "PDF (*.pdf)")
-        if path:
-            self._print_roll(page, self._make_printer(page, path if path.lower().endswith(".pdf") else path + ".pdf"))
+        path = self._export_path(page, self._sheet_filename(page, "pdf"), "Export Contact Sheet as PDF", "PDF (*.pdf)")
+        if path is None:
+            return
+        if path.suffix.lower() != ".pdf":
+            path = path.with_suffix(".pdf")
+        self._print_roll(page, self._make_printer(page, str(path)))
+        if path.exists():
+            self._exported([path], "Export PDF")
+
+    def export_image(self) -> None:
+        """The sheet as JPEG / TIFF / PNG at the size chosen in Settings, laid out exactly like the PDF."""
+        page = self._printable_page()
+        if page is None:
+            return
+        c = self.cfg
+        fmt = str(c.setting("export_format"))
+        long_px = int(c.setting("export_size"))
+        filt = {"jpg": "JPEG (*.jpg)", "tif": "TIFF (*.tif)", "png": "PNG (*.png)"}[fmt]
+        path = self._export_path(page, self._sheet_filename(page, fmt), "Export Contact Sheet as Image", filt)
+        if path is None:
+            return
+        view = page.canvas.view
+        n = len(page.canvas.order)
+        paper = paper_inches(view, n, bool(c.setting("print_header"))) if view in PAPER_INCHES else (10.0, 8.0)
+        cache: dict[Path, Optional[QPixmap]] = {}
+
+        def full_res(fr: Frame) -> Optional[QPixmap]:  # decode the original scan, sized for its cell
+            if fr.path not in cache:
+                try:
+                    img = open_any_image(fr.path)
+                    if fr.rotation:
+                        img = img.rotate(-90 * fr.rotation, expand=True)
+                    img.thumbnail((long_px, long_px), Image.LANCZOS)
+                    cache[fr.path] = QPixmap.fromImage(_pil_to_qimage(img))
+                except Exception:
+                    cache[fr.path] = page.canvas.preview_pixmap(fr)
+            return cache[fr.path]
+
+        prog = QProgressDialog("Rendering the contact sheet…", "Cancel", 0, 0, self)
+        prog.setWindowTitle("Export Contact Sheet as Image")
+        prog.setMinimumDuration(0)
+        prog.show()
+        QApplication.processEvents()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        saved: list[Path] = []
+        try:
+            job = self._sheet_job(page, full_res if c.setting("export_fullres") else None)
+            images = render_sheet_images(job, paper, long_px,
+                                         lambda done, total: (QApplication.processEvents(), not prog.wasCanceled())[1])
+            for k, img in enumerate(images, start=1):
+                target = path if len(images) == 1 else path.with_name(f"{path.stem}_p{k}{path.suffix}")
+                save_sheet_image(img, target, fmt)
+                saved.append(target)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Export Contact Sheet as Image", f"The export stopped:\n{exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+            prog.close()
+        if saved:
+            self._exported(saved, "Export Image")
 
     # ── updates ────────────────────────────────────────────────────────────
     def _update_repo(self) -> str:
