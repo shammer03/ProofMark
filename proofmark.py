@@ -552,12 +552,23 @@ def read_rr_exif(image: Path) -> Optional[dict[str, str]]:
     return {k: v for k, v in out.items() if v}
 
 
-def merge_rapidraw_exif(image: Path, values: dict[str, str], owned: dict[str, str]) -> Optional[dict[str, str]]:
+# Marks that become RapidRAW tags ("user:" is RapidRAW's prefix for your own tags; "color:" is its labels).
+MARK_TAGS = {T_STAR: "user:star", T_REJECT: "user:rejected", T_PUSH: "user:push", T_PULL: "user:pull",
+             T_CROP: "user:crop"}
+
+
+def _owned_rating_ok(current: Any, owned: Any) -> bool:
+    """ProofMark may set a rating only if there is none yet, or it is still the one ProofMark set."""
+    return current in (None, 0, "0", "") or (owned is not None and str(current) == str(owned))
+
+
+def merge_rapidraw(image: Path, exif_values: dict[str, str], rating: int, tags: set[str],
+                   owned: dict[str, Any]) -> Optional[dict[str, Any]]:
     """
-    Put `values` into the "exif" map of RapidRAW's sidecar, keeping everything else in the file.
-    A field is only (over)written when it is empty or still holds what ProofMark wrote last time
-    (`owned`), so edits made in RapidRAW win. Returns the fields ProofMark now owns, or None when
-    the sidecar was left alone (unreadable, or the image's EXIF couldn't be read to seed it).
+    Merge ProofMark's data into RapidRAW's <image>.rrdata, keeping everything else in the file:
+    `exif_values` into its "exif" map, `rating` (0-5) and `tags`. Each field is only written when it
+    is empty or still holds what ProofMark wrote last time (`owned`), so anything you change in
+    RapidRAW wins. Returns what ProofMark now owns, or None if the sidecar was left alone (unreadable).
     """
     path = rr_sidecar_path(image)
     data: dict[str, Any] = {}
@@ -571,34 +582,86 @@ def merge_rapidraw_exif(image: Path, values: dict[str, str], owned: dict[str, st
         if "marks" in data and "adjustments" not in data:
             data = {}  # written by ProofMark <= 1.1.1; its marks now live in .pmdata
     before = json.dumps(data, sort_keys=True)
+    new_owned: dict[str, Any] = {"exif": {}, "rating": None, "tags": []}
+
     exif = data.get("exif")
     if not isinstance(exif, dict):
         # RapidRAW shows this map instead of the file's EXIF once it exists, so start from the file's.
+        # If the file's EXIF can't be read, leave the map out: RapidRAW fills it in itself.
         exif = read_rr_exif(image)
-        if exif is None:
-            return None
-    new_owned: dict[str, str] = {}
-    for key, value in values.items():
-        current = str(exif.get(key, "")).replace('"', "").strip()
-        if value and (not current or current == "..." or current.startswith("0x") or current == owned.get(key)):
-            exif[key] = value
-            new_owned[key] = value
-    if not new_owned and not path.exists():
-        return new_owned  # nothing to hand over: don't create a sidecar just for the file's own EXIF
+    if exif is not None:
+        old = owned.get("exif") or {}
+        for key, value in exif_values.items():
+            current = str(exif.get(key, "")).replace('"', "").strip()
+            if value and (not current or current == "..." or current.startswith("0x") or current == old.get(key)):
+                exif[key] = value
+                new_owned["exif"][key] = value
+
+    current_rating = data.get("rating", 0)
+    if _owned_rating_ok(current_rating, owned.get("rating")):
+        data["rating"] = rating
+        new_owned["rating"] = rating or None
+
+    current_tags = [t for t in (data.get("tags") or []) if isinstance(t, str)]
+    ours = set(owned.get("tags") or [])
+    kept = [t for t in current_tags if not (t in ours and t not in tags)]  # drop our tags for removed marks
+    added = sorted(t for t in tags if t not in kept)
+    new_owned["tags"] = sorted((ours & tags & set(kept)) | set(added))
+    final_tags = sorted(set(kept) | set(added))
+    if final_tags or data.get("tags"):
+        data["tags"] = final_tags or None
+
+    anything = new_owned["exif"] or new_owned["rating"] or new_owned["tags"]
+    if not path.exists() and not anything:
+        return new_owned  # nothing to hand over: don't create a sidecar
     data.setdefault("version", 1)
     data.setdefault("rating", 0)
     data.setdefault("adjustments", None)
-    data["exif"] = exif
+    if exif is not None and (exif or "exif" in data):
+        data["exif"] = exif
     if json.dumps(data, sort_keys=True) != before:
         atomic_write_json(path, data)
     return new_owned
+
+
+_XMP_RATING_ATTR = re.compile(r'xmp:Rating\s*=\s*"([^"]*)"')
+_XMP_RATING_TAG = re.compile(r"<xmp:Rating\s*>([^<]*)</xmp:Rating>")
+
+
+def merge_xmp_rating(xmp: Path, rating: int, owned: Any) -> tuple[bool, Any]:
+    """
+    Update xmp:Rating in another app's .xmp (Lightroom, darktable, digiKam, Capture One, RapidRAW),
+    leaving the rest of the file as it is. -1 means rejected. Only replaces a rating that is unset,
+    0, or still the one ProofMark wrote. Returns (file changed, rating ProofMark now owns).
+    """
+    text = xmp.read_text(encoding="utf-8", errors="replace")
+    m = _XMP_RATING_ATTR.search(text) or _XMP_RATING_TAG.search(text)
+    current = m.group(1).strip() if m else None
+    if not _owned_rating_ok(current, owned):
+        return False, None
+    if (current or "0") == str(rating):
+        return False, (rating or None)
+    if _XMP_RATING_ATTR.search(text):
+        text = _XMP_RATING_ATTR.sub(f'xmp:Rating="{rating}"', text, count=1)
+    elif _XMP_RATING_TAG.search(text):
+        text = _XMP_RATING_TAG.sub(f"<xmp:Rating>{rating}</xmp:Rating>", text, count=1)
+    elif "</rdf:Description>" in text:
+        i = text.rfind("</rdf:Description>")
+        ns = "" if "xmlns:xmp=" in text else ' xmlns:xmp="http://ns.adobe.com/xap/1.0/"'
+        text = text[:i] + f" <xmp:Rating{ns}>{rating}</xmp:Rating>\n" + text[i:]
+    else:
+        return False, None
+    tmp = xmp.with_name(xmp.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, xmp)
+    return True, (rating or None)
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "font_family": "", "font_size": 10, "ui_scale": 100, "accent": "#FFA726",
     "menu_mode": "top", "toolbar_area": "top", "rebate_scale": 100,
     "default_columns": 6, "hover_loupe": True,
-    "autosave_secs": 4, "sync_enabled": True, "rapidraw_exif": True,
+    "autosave_secs": 4, "sync_enabled": True, "rapidraw_exif": True, "xmp_sync": True, "star_rating": 5,
     "print_direct": False, "print_ink_saver": False, "print_header": True,
     "auto_update_check": True, "update_repo": "",
 }
@@ -1881,14 +1944,25 @@ class SettingsDialog(QDialog):
         fs = QWidget()
         ff = QFormLayout(fs)
         self.autosave = self._spin(2, 60, int(s("autosave_secs")), " s")
-        self.sync_enabled = QCheckBox("Write .pmdata / .xmp sidecars automatically")
+        self.sync_enabled = QCheckBox("Sync automatically while you mark (otherwise use the ⟳ Sync button)")
         self.sync_enabled.setChecked(bool(s("sync_enabled")))
-        self.rapidraw_exif = QCheckBox("Add artist, copyright and film / camera / lens to RapidRAW's .rrdata sidecar\n"
-                                       "(applied when RapidRAW exports; your original files are never modified)")
+        self.rapidraw_exif = QCheckBox("RapidRAW (.rrdata): Star rating, mark tags (user:star, user:rejected…), and\n"
+                                       "artist / copyright / film · camera · lens, applied when RapidRAW exports")
         self.rapidraw_exif.setChecked(bool(s("rapidraw_exif")))
+        self.xmp_sync = QCheckBox("Other apps' .xmp (Lightroom, darktable, digiKam, Capture One): rating,\n"
+                                  "with Reject as -1 (their \"rejected\")")
+        self.xmp_sync.setChecked(bool(s("xmp_sync")))
+        self.star_rating = self._spin(1, 5, int(s("star_rating")), " ★")
+        self.star_rating.setToolTip("Rating a Star mark gives a frame in RapidRAW and other apps")
+        note = QLabel("Ratings, tags and fields you change in those apps are never overwritten.\n"
+                      "Your original image files are never modified.")
+        note.setStyleSheet("color:#999;")
         ff.addRow("Session autosave every", self.autosave)
         ff.addRow(self.sync_enabled)
         ff.addRow(self.rapidraw_exif)
+        ff.addRow(self.xmp_sync)
+        ff.addRow("Star mark sets rating", self.star_rating)
+        ff.addRow(note)
         tabs.addTab(fs, "Files && Sync")
 
         # ── Printing ──
@@ -1966,6 +2040,7 @@ class SettingsDialog(QDialog):
             "rebate_scale": self.rebate.value(), "default_columns": self.cols.value(),
             "hover_loupe": self.hover_loupe.isChecked(), "autosave_secs": self.autosave.value(),
             "sync_enabled": self.sync_enabled.isChecked(), "rapidraw_exif": self.rapidraw_exif.isChecked(),
+            "xmp_sync": self.xmp_sync.isChecked(), "star_rating": self.star_rating.value(),
             "print_direct": self.print_direct.isChecked(), "print_ink_saver": self.ink_saver.isChecked(),
             "print_header": self.print_header.isChecked(), "auto_update_check": self.auto_update.isChecked(),
             "update_repo": self.repo.text().strip()}
@@ -2136,7 +2211,9 @@ class RapidSyncWorker(QThread):
         super().__init__(parent)
         self._queue: "queue.Queue[Optional[SyncJob]]" = queue.Queue()
         self._running = True
-        self.rapidraw_exif = True
+        self.rapidraw_exif = True   # RapidRAW .rrdata: metadata, Star rating, tags
+        self.xmp_sync = True        # other apps' existing .xmp: rating
+        self.star_rating = 5
 
     def submit(self, job: SyncJob) -> None:
         self._queue.put(job)
@@ -2160,53 +2237,80 @@ class RapidSyncWorker(QThread):
                     self._running = False
                     break
                 batch[nxt.path] = nxt
-            errors = 0
+            totals = {"rapidraw": 0, "xmp": 0, "warn": 0}
             for j in batch.values():
-                errors += 0 if self._process(j) else 1
+                for k, v in self._process(j).items():
+                    totals[k] += v
             msg = f"Synced {len(batch)} frame(s)"
-            if errors:
-                msg += f" — {errors} with warnings"
+            if self.rapidraw_exif:
+                msg += f"  ·  RapidRAW sidecars updated: {totals['rapidraw']}"
+            if self.xmp_sync:
+                msg += f"  ·  other apps' .xmp updated: {totals['xmp']}"
+            if totals["warn"]:
+                msg += f"  ·  {totals['warn']} skipped (unreadable file or sidecar)"
             self.status.emit(msg)
 
-    def _process(self, job: SyncJob) -> bool:
-        ok = True
+    def _process(self, job: SyncJob) -> dict[str, int]:
+        """Write one frame's sidecars. Returns counts: rapidraw / xmp files changed, warnings."""
+        counts = {"rapidraw": 0, "xmp": 0, "warn": 0}
         sidecar = pm_sidecar_path(job.path)
-        owned: dict[str, str] = {}
+        old: dict[str, Any] = {}
         try:
-            old = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else {}
-            owned = dict(old.get("rapidraw_exif") or {}) if isinstance(old, dict) else {}
-        except (OSError, ValueError, TypeError):
+            loaded = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else {}
+            old = loaded if isinstance(loaded, dict) else {}
+        except (OSError, ValueError):
             pass
+        owned_rr = old.get("rapidraw") or {"exif": old.get("rapidraw_exif") or {}}  # 1.1.2 kept only exif
+        owned_xmp: dict[str, Any] = dict(old.get("xmp_owned") or {})
+        kinds = {m.get("kind") for m in job.marks}
+        rejected = T_REJECT in kinds
+        rating = self.star_rating if (T_STAR in kinds and not rejected) else 0
+
         if self.rapidraw_exif:
             gear = [f"Film: {job.film} (ISO {job.iso})" if job.film else "",
                     f"Camera: {job.camera}" if job.camera else "", f"Lens: {job.lens}" if job.lens else ""]
             values = {"Artist": job.artist, "Copyright": job.copyright,
                       "UserComment": "  ·  ".join(g for g in gear if g)}
+            tags = {MARK_TAGS[k] for k in kinds if k in MARK_TAGS}
+            rr = rr_sidecar_path(job.path)
+            before = rr.read_bytes() if rr.exists() else None
             try:
-                result = merge_rapidraw_exif(job.path, values, owned)
+                result = merge_rapidraw(job.path, values, rating, tags, owned_rr)
             except OSError:
                 result = None
             if result is None:
-                ok = False
+                counts["warn"] += 1
             else:
-                owned = result
+                owned_rr = result
+                if rr.exists() and rr.read_bytes() != before:
+                    counts["rapidraw"] += 1
+
+        xmp_rating = -1 if rejected else rating  # -1 = rejected in Lightroom / darktable / digiKam
+        own_xmp = job.path.with_suffix(".xmp")
         try:
+            if self.xmp_sync:
+                # photo.xmp (Lightroom, Capture One, RapidRAW) and photo.jpg.xmp (darktable, digiKam)
+                for xmp in (own_xmp, job.path.with_name(job.path.name + ".xmp")):
+                    if not xmp.exists() or "ns.proofmark.app" in xmp.read_text(encoding="utf-8", errors="replace"):
+                        continue
+                    changed, owned_xmp[xmp.name] = merge_xmp_rating(xmp, xmp_rating, owned_xmp.get(xmp.name))
+                    counts["xmp"] += int(changed)
+            # ProofMark's own .xmp when no other app has one (same name RapidRAW and Lightroom use)
+            if not own_xmp.exists() or "ns.proofmark.app" in own_xmp.read_text(encoding="utf-8", errors="replace"):
+                own_xmp.write_text(self._xmp(job, xmp_rating), encoding="utf-8")
             atomic_write_json(sidecar, {
                 "version": 1, "file": job.path.name, "rating": job.rating, "marks": job.marks,
                 "film": job.film, "iso": job.iso, "camera": job.camera, "lens": job.lens,
-                "artist": job.artist, "copyright": job.copyright, "rapidraw_exif": owned})
-            xmp = job.path.with_suffix(".xmp")
-            # Same file name RapidRAW and Lightroom use: only replace an .xmp that ProofMark wrote itself.
-            if not xmp.exists() or "ns.proofmark.app" in xmp.read_text(encoding="utf-8", errors="replace"):
-                xmp.write_text(self._xmp(job), encoding="utf-8")
+                "artist": job.artist, "copyright": job.copyright,
+                "rapidraw": owned_rr, "xmp_owned": {k: v for k, v in owned_xmp.items() if v is not None}})
         except OSError:
-            ok = False
-        return ok
+            counts["warn"] += 1
+        return counts
 
     @staticmethod
-    def _xmp(job: SyncJob) -> str:
+    def _xmp(job: SyncJob, rating: int) -> str:
         kinds = [m["kind"] for m in job.marks]
-        attrs = (f' xmp:Rating="{job.rating}" tiff:Model={quoteattr(job.camera)}'
+        attrs = (f' xmp:Rating="{rating}" tiff:Model={quoteattr(job.camera)}'
                  f' aux:Lens={quoteattr(job.lens)} proofmark:Film={quoteattr(job.film)}')
         artist = f"<dc:creator><rdf:Seq><rdf:li>{escape(job.artist)}</rdf:li></rdf:Seq></dc:creator>" if job.artist else ""
         rights = (f'<dc:rights><rdf:Alt><rdf:li xml:lang="x-default">{escape(job.copyright)}</rdf:li></rdf:Alt></dc:rights>'
@@ -2727,7 +2831,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
 
     def loupe_geometry(self, idx: int, locked: bool) -> tuple[QRectF, QRectF]:
         vw, vh = self.viewport().width(), self.viewport().height()
-        frac = 0.85 if locked else 0.5
+        frac = 0.92 if locked else 0.55
         bw, bh = vw * frac, vh * frac
         if locked:
             box = QRectF((vw - bw) / 2, (vh - bh) / 2, bw, bh)
@@ -3485,7 +3589,7 @@ class MainWindow(QMainWindow):
         self._act(m_file, "Print Contact Sheet…", self.print_sheet, "Ctrl+P")
         self._act(m_file, "Export Contact Sheet as PDF…", self.export_pdf, "Ctrl+Shift+E")
         m_file.addSeparator()
-        self._act(m_file, "Sync All Frames Now", self.sync_all, "Ctrl+S")
+        self._act(m_file, "Sync to RapidRAW && Other Apps", self.sync_all, "Ctrl+S")
         self._act(m_file, "Save Session", self.save_session)
         m_file.addSeparator()
         self._act(m_file, "Settings…", self.open_settings, "Ctrl+,")
@@ -3536,6 +3640,11 @@ class MainWindow(QMainWindow):
         self.print_action.setToolTip("Print a clean, unmarked contact sheet  (Ctrl+P)")
         self.print_action.triggered.connect(lambda _c=False: self.print_sheet())
         tb.addAction(self.print_action)
+        self.sync_action = QAction("⟳ Sync", self)
+        self.sync_action.setToolTip("Sync marks, ratings, tags and metadata to the sidecars RapidRAW and other\n"
+                                    "workflow apps read, for every frame in every open roll  (Ctrl+S)")
+        self.sync_action.triggered.connect(lambda _c=False: self.sync_all())
+        tb.addAction(self.sync_action)
         tb.addSeparator()
         tb.addWidget(QLabel(" View "))
         self.view_combo = QComboBox()
@@ -3772,9 +3881,12 @@ class MainWindow(QMainWindow):
         self.mark_dirty()
 
     def sync_all(self) -> None:
+        if not self.pages():
+            self.statusBar().showMessage("Import a roll first.", 4000)
+            return
         for page in self.pages():
-            page.flush_sync(everything=True)
-        self.statusBar().showMessage("Sync queued for all frames…", 4000)
+            page.flush_sync(everything=True)  # runs even when automatic sync is switched off
+        self.statusBar().showMessage("Syncing all frames to RapidRAW and .xmp sidecars…", 4000)
 
     # ── dialogs ────────────────────────────────────────────────────────────
     def _refresh_all_equipment(self) -> None:
@@ -3808,7 +3920,7 @@ class MainWindow(QMainWindow):
             "BRUSH\n[ / ]  Smaller / larger     1-4  Red / Toxic green / Silver / Yellow\n"
             "Pen menu: wax pencil, china marker, felt marker or standard line\n\n"
             "VIEWING\n"
-            "Hover  loupe beside the frame     Click (Inspect) / Right-click / Space  Enlarge to 85%\n"
+            "Hover  loupe beside the frame     Click (Inspect) / Right-click / Space  Enlarge to 92%\n"
             "View menu  Full screen, or the sheet as it prints on 4×6, 5×7 or 8×10 paper\n"
             "Ctrl+Wheel  Zoom 0.7×–4.5×     Right-drag  Pan     0  Reset zoom\n"
             "C  2-up compare (hover for [B]); C or Esc exits\n\n"
@@ -3901,6 +4013,8 @@ class MainWindow(QMainWindow):
         self._apply_layout_prefs()
         self.autosave.setInterval(max(2, int(c.setting("autosave_secs"))) * 1000)
         self.sync_worker.rapidraw_exif = bool(c.setting("rapidraw_exif"))
+        self.sync_worker.xmp_sync = bool(c.setting("xmp_sync"))
+        self.sync_worker.star_rating = int(c.setting("star_rating"))
         for page in self.pages():
             page.canvas.print_header = bool(c.setting("print_header"))
             page.canvas.set_columns(int(c.setting("default_columns")))
