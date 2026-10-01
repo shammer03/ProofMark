@@ -25,6 +25,9 @@
   <url type="bugtracker">https://github.com/shammer03/ProofMark/issues</url>
   <!-- TODO: add at least one <screenshot> (required by Flathub) -->
   <releases>
+    <release version="1.2.0" date="2026-10-01">
+      <description><ul><li>Keyboard culling: ratings, rejects and frame notes</li><li>Undo and redo for all edits</li><li>Show filter and optional marked contact sheets</li><li>Pen styles and print-size views (4x6, 5x7, 8x10)</li><li>Export selects, roll notes and recent rolls</li><li>Sync Data button; ratings and tags sync to RapidRAW and XMP</li><li>Larger loupe that opens beside the frame</li></ul></description>
+    </release>
     <release version="1.1.2" date="2026-09-30">
       <description><ul><li>Non-destructive like RapidRAW: your original image files are never modified</li><li>Artist, copyright and film / camera / lens go into RapidRAW's .rrdata sidecar and are applied when RapidRAW exports</li><li>ProofMark's marks moved to their own .pmdata sidecar, so RapidRAW edits are no longer overwritten</li><li>An existing .xmp from another app is no longer replaced</li></ul></description>
     </release>

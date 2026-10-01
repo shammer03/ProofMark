@@ -72,9 +72,9 @@ Image.MAX_IMAGE_PIXELS = None
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME = "ProofMark"
-APP_VERSION = "1.1.2"
-BUILD_NUMBER = 7
-BUILD_DATE = "2026-09-30"
+APP_VERSION = "1.2.0"
+BUILD_NUMBER = 8
+BUILD_DATE = "2026-10-01"
 RELEASE_CHANNEL = "stable"
 APP_ID = "io.github.shammer03.ProofMark"  # reverse-DNS id used by Flatpak / AppStream; change to your own
 UPDATE_REPO = "shammer03/ProofMark"  # GitHub "owner/repo" that publishes releases (or set it in Settings ▸ Updates)
@@ -83,6 +83,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Newest first. `release.py bump` inserts new entries at the marker.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
     # <changelog-insert>
+    ("1.2.0", "2026-10-01", [
+        'Keyboard culling: ratings, rejects and frame notes',
+        'Undo and redo for all edits',
+        'Show filter and optional marked contact sheets',
+        'Pen styles and print-size views (4x6, 5x7, 8x10)',
+        'Export selects, roll notes and recent rolls',
+        'Sync Data button; ratings and tags sync to RapidRAW and XMP',
+        'Larger loupe that opens beside the frame']),
     ("1.1.2", "2026-09-30", [
         'Non-destructive like RapidRAW: your original image files are never modified',
         "Artist, copyright and film / camera / lens go into RapidRAW's .rrdata sidecar and are applied when RapidRAW exports",
