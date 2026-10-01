@@ -56,13 +56,13 @@ from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, Q
                             QTimer, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontMetrics,
                            QIcon, QImage, QPainter, QPainterPath, QPen,
-                           QPixmap)
+                           QPixmap, QTransform)
 from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QComboBox,
                                QCompleter, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMainWindow, QMenu,
-                               QMessageBox, QPushButton, QSlider, QSpinBox, QTabWidget,
+                               QMessageBox, QPushButton, QSizePolicy, QSlider, QSpinBox, QTabWidget,
                                QVBoxLayout, QWidget)
 
 Image.MAX_IMAGE_PIXELS = None
@@ -219,6 +219,9 @@ T_ADJUST = "adjust"
 BRUSH_COLORS = [("Red", "#FF3B30"), ("Toxic Green", "#39FF14"),
                 ("Silver", "#E6E6EA"), ("Yellow", "#FFE600")]
 DEFAULT_BRUSH_COLOR = BRUSH_COLORS[0][1]
+# Rating a Star mark gives, by wax colour (Settings ▸ Files & Sync can change these)
+DEFAULT_STAR_RATINGS = {"#FF3B30": 5, "#39FF14": 5, "#FFE600": 4, "#E6E6EA": 3}
+STAR_RATINGS: dict[str, int] = dict(DEFAULT_STAR_RATINGS)
 PEN_STYLES = [("wax", "Wax pencil"), ("china", "China marker"), ("marker", "Felt marker"), ("standard", "Standard")]
 PEN_NAMES = dict(PEN_STYLES)
 DEFAULT_PEN = "wax"
@@ -408,6 +411,11 @@ class Frame:
         self.aspect: float = THUMB_W / THUMB_H
         self.marks: list[Mark] = []
         self.error: str = ""  # set when the file could not be decoded
+        self.user_rating: Optional[int] = None  # set with the 1-5 keys; None = from the Star marks
+        self.note: str = ""                     # darkroom note
+        self.rotation: int = 0                  # quarter turns clockwise, display only
+        self.thumb0: Optional[QImage] = None    # as decoded, before rotation
+        self.preview0: Optional[QImage] = None
 
     @property
     def rejected(self) -> bool:
@@ -419,9 +427,22 @@ class Frame:
 
     @property
     def rating(self) -> int:
+        """-1 rejected, else 0-5: the keyboard rating, or the best Star by its wax colour."""
         if self.rejected:
             return -1
-        return 5 if self.starred else 0
+        if self.user_rating is not None:
+            return self.user_rating
+        return max((STAR_RATINGS.get(m.color.upper(), 5) for m in self.marks if m.kind == T_STAR), default=0)
+
+    def extras(self) -> dict[str, Any]:
+        """Per-frame data besides marks, as stored in .pmdata and the session."""
+        return {"user_rating": self.user_rating, "note": self.note, "rotation": self.rotation}
+
+    def apply_extras(self, d: dict[str, Any]) -> None:
+        r = d.get("user_rating")
+        self.user_rating = int(r) if isinstance(r, (int, float)) and 0 <= r <= 5 else None
+        self.note = str(d.get("note") or "")
+        self.rotation = int(d.get("rotation") or 0) % 4
 
     @property
     def sidecar(self) -> Path:
@@ -439,6 +460,22 @@ class Roll:
         files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in ALL_EXTS]
         files.sort(key=lambda p: natural_key(p.name))
         self.frames: list[Frame] = [Frame(p) for p in files]
+        self.note = ""  # roll note, kept in the folder's .proofmark-roll.json
+        try:
+            data = json.loads(self.note_file.read_text(encoding="utf-8"))
+            self.note = str(data.get("note") or "") if isinstance(data, dict) else ""
+        except (OSError, ValueError):
+            pass
+
+    @property
+    def note_file(self) -> Path:
+        return self.folder / ".proofmark-roll.json"
+
+    def save_note(self) -> None:
+        try:
+            atomic_write_json(self.note_file, {"version": 1, "note": self.note})
+        except OSError:
+            pass
 
     def load_sidecar_marks(self) -> None:
         for fr in self.frames:
@@ -450,20 +487,29 @@ class Roll:
                         data = json.loads(path.read_text(encoding="utf-8"))
                         if isinstance(data, dict) and "marks" in data:
                             fr.marks = [Mark.from_dict(m) for m in data["marks"]]
+                            if path == fr.sidecar:
+                                fr.apply_extras(data)
                             break
                 except (OSError, ValueError, KeyError, TypeError):
                     continue
 
-    def apply_marks(self, table: dict[str, list[dict[str, Any]]]) -> None:
+    def apply_marks(self, table: dict[str, list[dict[str, Any]]],
+                    extras: Optional[dict[str, dict[str, Any]]] = None) -> None:
         for fr in self.frames:
             if fr.name in table:
                 try:
                     fr.marks = [Mark.from_dict(m) for m in table[fr.name]]
                 except (KeyError, TypeError, ValueError):
                     continue
+            if extras and isinstance(extras.get(fr.name), dict):
+                fr.apply_extras(extras[fr.name])
 
     def marks_table(self) -> dict[str, list[dict[str, Any]]]:
         return {fr.name: [m.to_dict() for m in fr.marks] for fr in self.frames if fr.marks}
+
+    def extras_table(self) -> dict[str, dict[str, Any]]:
+        return {fr.name: fr.extras() for fr in self.frames
+                if fr.user_rating is not None or fr.note or fr.rotation}
 
 
 def atomic_write_json(path: Path, data: Any) -> None:
@@ -661,7 +707,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "font_family": "", "font_size": 10, "ui_scale": 100, "accent": "#FFA726",
     "menu_mode": "top", "toolbar_area": "top", "rebate_scale": 100,
     "default_columns": 6, "hover_loupe": True,
-    "autosave_secs": 4, "sync_enabled": True, "rapidraw_exif": True, "xmp_sync": True, "star_rating": 5,
+    "autosave_secs": 4, "sync_enabled": True, "rapidraw_exif": True, "xmp_sync": True, "sync_on_exit": True,
+    "star_ratings": dict(DEFAULT_STAR_RATINGS), "print_marks": False,
     "print_direct": False, "print_ink_saver": False, "print_header": True,
     "auto_update_check": True, "update_repo": "",
 }
@@ -1235,6 +1282,8 @@ QTabBar::tab { background: #141414; color: #bbbbbb; padding: 7px 16px; border: 1
 QTabBar::tab:selected { color: #000000; background: #FFA726; font-weight: bold; }
 QPushButton { background: #1b1b1b; color: #FFFFFF; border: 1px solid #333; padding: 6px 14px; border-radius: 3px; }
 QPushButton:hover { border-color: #FFA726; color: #FFA726; }
+QPushButton#syncButton { background: #FFA726; color: #000000; font-weight: bold; padding: 6px 18px; border: none; }
+QPushButton#syncButton:hover { background: #FFFFFF; color: #000000; }
 QComboBox, QLineEdit, QSpinBox, QListWidget { background: #141414; color: #FFFFFF; border: 1px solid #333;
     padding: 4px 6px; selection-background-color: #FFA726; selection-color: #000000; }
 QComboBox QAbstractItemView { background: #141414; color: #FFFFFF; selection-background-color: #FFA726; selection-color: #000; }
@@ -1952,16 +2001,31 @@ class SettingsDialog(QDialog):
         self.xmp_sync = QCheckBox("Other apps' .xmp (Lightroom, darktable, digiKam, Capture One): rating,\n"
                                   "with Reject as -1 (their \"rejected\")")
         self.xmp_sync.setChecked(bool(s("xmp_sync")))
-        self.star_rating = self._spin(1, 5, int(s("star_rating")), " ★")
-        self.star_rating.setToolTip("Rating a Star mark gives a frame in RapidRAW and other apps")
+        self.sync_on_exit = QCheckBox("Sync every frame when ProofMark closes")
+        self.sync_on_exit.setChecked(bool(s("sync_on_exit")))
+        ratings = s("star_ratings") or {}
+        star_row = QHBoxLayout()
+        self.star_spins: dict[str, QSpinBox] = {}
+        for cname, chex in BRUSH_COLORS:
+            sp = self._spin(1, 5, int(ratings.get(chex, DEFAULT_STAR_RATINGS[chex])), " ★")
+            sp.setToolTip(f"Rating a {cname} Star gives a frame (the 1-5 keys override it)")
+            self.star_spins[chex] = sp
+            star_row.addWidget(QLabel(cname))
+            star_row.addWidget(sp)
+        star_row.addStretch(1)
+        sync_now = QPushButton("⟳  Sync Data now")
+        sync_now.setToolTip("Sync every frame of every open roll right now")
+        sync_now.clicked.connect(self._sync_now)
         note = QLabel("Ratings, tags and fields you change in those apps are never overwritten.\n"
                       "Your original image files are never modified.")
         note.setStyleSheet("color:#999;")
         ff.addRow("Session autosave every", self.autosave)
         ff.addRow(self.sync_enabled)
+        ff.addRow(self.sync_on_exit)
+        ff.addRow(sync_now)
         ff.addRow(self.rapidraw_exif)
         ff.addRow(self.xmp_sync)
-        ff.addRow("Star mark sets rating", self.star_rating)
+        ff.addRow("Star colour → rating", star_row)
         ff.addRow(note)
         tabs.addTab(fs, "Files && Sync")
 
@@ -1974,9 +2038,12 @@ class SettingsDialog(QDialog):
         self.ink_saver.setChecked(bool(s("print_ink_saver")))
         self.print_header = QCheckBox("Print a header (roll, film, camera, lens, date) and page footer")
         self.print_header.setChecked(bool(s("print_header")))
+        self.print_marks = QCheckBox("Print grease marks, ratings and notes on the sheet (off = clean sheet)")
+        self.print_marks.setChecked(bool(s("print_marks")))
         fp.addRow(self.print_direct)
         fp.addRow(self.ink_saver)
         fp.addRow(self.print_header)
+        fp.addRow(self.print_marks)
         tabs.addTab(pr, "Printing")
 
         # ── Updates ──
@@ -2018,6 +2085,11 @@ class SettingsDialog(QDialog):
             self._accent = c.name().upper()
             self._paint_accent()
 
+    def _sync_now(self) -> None:
+        win = self.parent()
+        if win is not None and hasattr(win, "sync_all"):
+            win.sync_all()
+
     def _reset_appearance(self) -> None:
         d = DEFAULT_SETTINGS
         self.sys_font.setChecked(True)
@@ -2040,13 +2112,114 @@ class SettingsDialog(QDialog):
             "rebate_scale": self.rebate.value(), "default_columns": self.cols.value(),
             "hover_loupe": self.hover_loupe.isChecked(), "autosave_secs": self.autosave.value(),
             "sync_enabled": self.sync_enabled.isChecked(), "rapidraw_exif": self.rapidraw_exif.isChecked(),
-            "xmp_sync": self.xmp_sync.isChecked(), "star_rating": self.star_rating.value(),
+            "xmp_sync": self.xmp_sync.isChecked(), "sync_on_exit": self.sync_on_exit.isChecked(),
+            "star_ratings": {h: sp.value() for h, sp in self.star_spins.items()},
+            "print_marks": self.print_marks.isChecked(),
             "print_direct": self.print_direct.isChecked(), "print_ink_saver": self.ink_saver.isChecked(),
             "print_header": self.print_header.isChecked(), "auto_update_check": self.auto_update.isChecked(),
             "update_repo": self.repo.text().strip()}
         for key, value in values.items():
             self.cfg.set_setting(key, value)
         self.cfg.save()
+        self.accept()
+
+
+class ExportSelectsDialog(QDialog):
+    """Copy the selected frames (and their sidecars) to a folder and write a selects list for a lab order."""
+
+    def __init__(self, roll: Roll, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.roll = roll
+        self.report = ""
+        self.setWindowTitle("Export Selects")
+        self.resize(560, 300)
+        self.min_rating = QSpinBox()
+        self.min_rating.setRange(1, 5)
+        self.min_rating.setSuffix(" ★ or better")
+        self.min_rating.valueChanged.connect(self._update_count)
+        self.dest = QLineEdit(str(roll.folder / "Selects"))
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        dest_row = QHBoxLayout()
+        dest_row.addWidget(self.dest, 1)
+        dest_row.addWidget(browse)
+        self.copy_images = QCheckBox("Copy the image files")
+        self.copy_images.setChecked(True)
+        self.copy_sidecars = QCheckBox("Copy their sidecars too (.pmdata, .rrdata, .xmp) so ratings and marks travel along")
+        self.copy_sidecars.setChecked(True)
+        self.write_list = QCheckBox("Write selects.csv (frame, file, rating, marks, note) — handy for a lab print order")
+        self.write_list.setChecked(True)
+        self.count = QLabel("")
+        self.count.setObjectName("amber")
+        form = QFormLayout()
+        form.addRow("Frames rated", self.min_rating)
+        form.addRow("Export to", dest_row)
+        form.addRow(self.copy_images)
+        form.addRow(self.copy_sidecars)
+        form.addRow(self.write_list)
+        form.addRow(self.count)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Export")
+        buttons.accepted.connect(self._export)
+        buttons.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addStretch(1)
+        lay.addWidget(buttons)
+        self._update_count()
+
+    def _selected(self) -> list[tuple[int, Frame]]:
+        return [(i, fr) for i, fr in enumerate(self.roll.frames) if fr.rating >= self.min_rating.value()]
+
+    def _update_count(self) -> None:
+        n = len(self._selected())
+        self.count.setText(f"{n} frame(s) selected  (rejects are never exported)")
+
+    def _browse(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Export selects to", self.dest.text() or str(self.roll.folder))
+        if folder:
+            self.dest.setText(folder)
+
+    def _export(self) -> None:
+        import csv
+        frames = self._selected()
+        if not frames:
+            QMessageBox.information(self, "Export Selects", "No frames are rated that high yet.")
+            return
+        dest = Path(self.dest.text().strip()).expanduser()
+        if dest.resolve() == self.roll.folder.resolve():
+            QMessageBox.warning(self, "Export Selects", "Choose a different folder from the roll itself.")
+            return
+        copied = skipped = 0
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            for _i, fr in frames:
+                files = [fr.path] if self.copy_images.isChecked() else []
+                if self.copy_sidecars.isChecked():
+                    files += [pm_sidecar_path(fr.path), rr_sidecar_path(fr.path), fr.path.with_suffix(".xmp"),
+                              fr.path.with_name(fr.path.name + ".xmp")]
+                for src in files:
+                    if not src.exists():
+                        continue
+                    target = dest / src.name
+                    if target.exists():  # never overwrite
+                        skipped += 1
+                        continue
+                    shutil.copy2(src, target)
+                    copied += 1
+            if self.write_list.isChecked():
+                with open(dest / "selects.csv", "w", newline="", encoding="utf-8") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["frame", "file", "rating", "marks", "note", "roll", "film", "camera", "lens"])
+                    for i, fr in frames:
+                        w.writerow([f"{i + 1}A", fr.name, fr.rating, " ".join(sorted({m.kind for m in fr.marks})),
+                                    fr.note, self.roll.folder.name, self.roll.film, self.roll.camera, self.roll.lens])
+        except OSError as exc:
+            QMessageBox.warning(self, "Export Selects", f"Export stopped:\n{exc}")
+            return
+        self.report = (f"Exported {len(frames)} frame(s) to\n{dest}\n\n{copied} file(s) copied"
+                       + (f", {skipped} already there (left untouched)" if skipped else "")
+                       + ("\nselects.csv written" if self.write_list.isChecked() else ""))
         self.accept()
 
 
@@ -2193,13 +2366,14 @@ class ImageLoaderThread(QThread):
 class SyncJob:
     path: Path
     marks: list[dict[str, Any]]
-    rating: int
+    rating: int  # -1 rejected, else 0-5 (Frame.rating)
     artist: str
     copyright: str
     camera: str
     lens: str
     iso: int
     film: str
+    extras: dict[str, Any]  # keyboard rating, note, rotation
 
 
 class RapidSyncWorker(QThread):
@@ -2213,7 +2387,6 @@ class RapidSyncWorker(QThread):
         self._running = True
         self.rapidraw_exif = True   # RapidRAW .rrdata: metadata, Star rating, tags
         self.xmp_sync = True        # other apps' existing .xmp: rating
-        self.star_rating = 5
 
     def submit(self, job: SyncJob) -> None:
         self._queue.put(job)
@@ -2263,8 +2436,8 @@ class RapidSyncWorker(QThread):
         owned_rr = old.get("rapidraw") or {"exif": old.get("rapidraw_exif") or {}}  # 1.1.2 kept only exif
         owned_xmp: dict[str, Any] = dict(old.get("xmp_owned") or {})
         kinds = {m.get("kind") for m in job.marks}
-        rejected = T_REJECT in kinds
-        rating = self.star_rating if (T_STAR in kinds and not rejected) else 0
+        rejected = job.rating < 0
+        rating = max(0, job.rating)
 
         if self.rapidraw_exif:
             gear = [f"Film: {job.film} (ISO {job.iso})" if job.film else "",
@@ -2301,7 +2474,7 @@ class RapidSyncWorker(QThread):
             atomic_write_json(sidecar, {
                 "version": 1, "file": job.path.name, "rating": job.rating, "marks": job.marks,
                 "film": job.film, "iso": job.iso, "camera": job.camera, "lens": job.lens,
-                "artist": job.artist, "copyright": job.copyright,
+                "artist": job.artist, "copyright": job.copyright, **job.extras,
                 "rapidraw": owned_rr, "xmp_owned": {k: v for k, v in owned_xmp.items() if v is not None}})
         except OSError:
             counts["warn"] += 1
@@ -2316,6 +2489,9 @@ class RapidSyncWorker(QThread):
         rights = (f'<dc:rights><rdf:Alt><rdf:li xml:lang="x-default">{escape(job.copyright)}</rdf:li></rdf:Alt></dc:rights>'
                   if job.copyright else "")
         marks = "".join(f"<rdf:li>{escape(k)}</rdf:li>" for k in kinds)
+        note = job.extras.get("note") or ""
+        desc = (f'<dc:description><rdf:Alt><rdf:li xml:lang="x-default">{escape(note)}</rdf:li></rdf:Alt></dc:description>'
+                if note else "")
         return (
             '<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
             '<x:xmpmeta xmlns:x="adobe:ns:meta/">\n'
@@ -2327,7 +2503,7 @@ class RapidSyncWorker(QThread):
             '   xmlns:exif="http://ns.adobe.com/exif/1.0/"\n'
             '   xmlns:aux="http://ns.adobe.com/exif/1.0/aux/"\n'
             '   xmlns:proofmark="http://ns.proofmark.app/1.0/"' + attrs + '>\n'
-            f'   {artist}\n   {rights}\n'
+            f'   {artist}\n   {rights}\n   {desc}\n'
             f'   <exif:ISOSpeedRatings><rdf:Seq><rdf:li>{job.iso}</rdf:li></rdf:Seq></exif:ISOSpeedRatings>\n'
             f'   <proofmark:Marks><rdf:Bag>{marks}</rdf:Bag></proofmark:Marks>\n'
             '  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n<?xpacket end="w"?>\n')
@@ -2450,16 +2626,71 @@ def paint_rebate_strip(p: QPainter, cell: QRectF, rebate_h: float, number: str, 
     p.drawText(QRectF(edge_x, strip.y(), edge_w, strip.height()), Qt.AlignVCenter | Qt.AlignLeft, text)
 
 
+FILTERS = [("all", "All frames"), ("rated", "Stars & ratings"), ("3up", "3 ★ and up"),
+           ("norejects", "Hide rejects"), ("rejects", "Rejects only"), ("work", "Crop / push / pull")]
+FILTER_NAMES = dict(FILTERS)
+
+
+def frame_passes(fr: Frame, key: str) -> bool:
+    r = fr.rating
+    if key == "rated":
+        return r > 0
+    if key == "3up":
+        return r >= 3
+    if key == "norejects":
+        return r >= 0
+    if key == "rejects":
+        return r < 0
+    if key == "work":
+        return any(m.kind in (T_CROP, T_PUSH, T_PULL) for m in fr.marks)
+    return True
+
+
+def paint_frame_badges(p: QPainter, slot: QRectF, img: QRectF, fr: Frame) -> None:
+    """Rating stars (top right) and the darkroom note (bottom of the photo) on a frame."""
+    p.save()
+    p.setClipRect(slot)
+    small = max(7, int(slot.height() * 0.075))
+    if fr.rating > 0:
+        font = QFont("DejaVu Sans")
+        font.setPixelSize(small)
+        font.setBold(True)
+        p.setFont(font)
+        text = "★" * fr.rating
+        w = QFontMetrics(font, p.device()).horizontalAdvance(text) + small * 0.6
+        badge = QRectF(img.right() - w - 3, img.top() + 3, w, small * 1.35)
+        p.fillRect(badge, QColor(0, 0, 0, 170))
+        p.setPen(C_AMBER if fr.user_rating is None else QColor("#FFFFFF"))  # white = set with the keys
+        p.drawText(badge, Qt.AlignCenter, text)
+    if fr.note:
+        font = QFont("DejaVu Sans")
+        font.setPixelSize(max(7, int(small * 0.9)))
+        p.setFont(font)
+        strip = QRectF(img.left(), img.bottom() - small * 1.5, img.width(), small * 1.5)
+        p.fillRect(strip, QColor(0, 0, 0, 165))
+        p.setPen(QColor("#F0F0F0"))
+        line = fr.note.replace("\n", "  ·  ")
+        p.drawText(strip.adjusted(4, 0, -4, 0), Qt.AlignVCenter | Qt.AlignLeft,
+                   QFontMetrics(font, p.device()).elidedText("✎ " + line, Qt.ElideRight, int(strip.width() - 8)))
+    p.restore()
+
+
 def paint_frame_clean(p: QPainter, cell: QRectF, rebate_h: float, idx: int, meta: dict[str, Any],
-                      pm: Optional[QPixmap], ink_saver: bool = False) -> None:
-    """One frame exactly as on screen, without marks, selection or hover."""
+                      pm: Optional[QPixmap], ink_saver: bool = False, marked: Optional[Frame] = None) -> None:
+    """One frame as on screen, without selection or hover. With `marked`, its grease marks, rating and note too."""
     p.save()
     p.setClipRect(cell)
     p.fillRect(cell, QColor("#FFFFFF") if ink_saver else C_FILM)
     slot = frame_slot_rect(cell, rebate_h)
     p.fillRect(slot, QColor("#E6E6E6") if ink_saver else QColor("#0D0D0D"))
     if pm is not None and pm.height() > 0:
-        p.drawPixmap(fit_rect(slot, pm.width() / pm.height()), pm, QRectF(pm.rect()))
+        img = fit_rect(slot, pm.width() / pm.height())
+        p.drawPixmap(img, pm, QRectF(pm.rect()))
+        if marked is not None:
+            width = max(1.5, img.width() * 0.011)
+            for mk in marked.marks:
+                draw_mark(p, mk, img, width)
+            paint_frame_badges(p, slot, img, marked)
     paint_rebate_strip(p, cell, rebate_h, f"{idx + 1}A", meta, ink_saver)
     p.setPen(QPen(QColor("#000000") if ink_saver else QColor("#1C1C1C"), max(1.0, cell.width() * 0.004)))
     p.setBrush(Qt.NoBrush)
@@ -2522,7 +2753,8 @@ def paper_inches(view: str, n: int, header: bool) -> tuple[float, float]:
     return (long_, short) if landscape > portrait else (short, long_)
 
 
-def paint_sheet_text(p: QPainter, rect: QRectF, lay: SheetLayout, roll: Roll, page: int, color: QColor) -> None:
+def paint_sheet_text(p: QPainter, rect: QRectF, lay: SheetLayout, roll: Roll, page: int, color: QColor,
+                     count: Optional[int] = None) -> None:
     """Header (roll, film, camera, lens, date) and footer (version, frame count, page) of a sheet."""
     import datetime
     font = QFont("DejaVu Sans")
@@ -2530,18 +2762,23 @@ def paint_sheet_text(p: QPainter, rect: QRectF, lay: SheetLayout, roll: Roll, pa
     p.setFont(font)
     p.setPen(color)
     title = f"{roll.folder.name}   ·   {roll.film}   ·   {roll.camera}   ·   {roll.lens}"
+    if roll.note:
+        title += "   ·   " + roll.note.replace("\n", "  ")
     top = QRectF(rect.x(), rect.y(), rect.width(), lay.head_h)
     p.drawText(QRectF(top.x(), top.y(), top.width() * 0.75, top.height()), Qt.AlignVCenter | Qt.AlignLeft,
                QFontMetrics(font, p.device()).elidedText(title, Qt.ElideRight, int(top.width() * 0.75)))
     p.drawText(top, Qt.AlignVCenter | Qt.AlignRight, datetime.date.today().isoformat())
     foot = QRectF(rect.x(), rect.bottom() - lay.foot_h, rect.width(), lay.foot_h)
-    p.drawText(foot, Qt.AlignVCenter | Qt.AlignLeft, f"ProofMark v{APP_VERSION}  ·  {len(roll.frames)} frames")
+    total = len(roll.frames) if count is None else count
+    p.drawText(foot, Qt.AlignVCenter | Qt.AlignLeft, f"ProofMark v{APP_VERSION}  ·  {total} frames"
+               + (f" of {len(roll.frames)}" if total != len(roll.frames) else ""))
     p.drawText(foot, Qt.AlignVCenter | Qt.AlignRight, f"Page {page + 1} of {lay.pages}")
 
 
 def render_contact_sheet(printer: Any, roll: Roll, columns: Optional[int], meta: dict[str, Any],
                          pixmap_for: Callable[[Frame], Optional[QPixmap]],
-                         ink_saver: bool = False, header: bool = True) -> int:
+                         ink_saver: bool = False, header: bool = True,
+                         indices: Optional[list[int]] = None, marks: bool = False) -> int:
     """
     Print the roll on `printer` (paper or PDF). `columns` = the Full-screen column count, paginated;
     None = one contact sheet with every frame, as on the screen's print views. Returns the page count.
@@ -2553,23 +2790,25 @@ def render_contact_sheet(printer: Any, roll: Roll, columns: Optional[int], meta:
     # The painter's origin is already the top-left of the printable area (inside the margins).
     paint = printer.pageLayout().paintRectPixels(printer.resolution())
     rect = QRectF(0, 0, paint.width(), paint.height())
-    n = len(roll.frames)
+    shown = list(range(len(roll.frames))) if indices is None else indices  # the Show filter
+    n = len(shown)
     lay = sheet_layout(rect.width(), rect.height(), n, header, columns)
     for page in range(lay.pages):
         if page:
             printer.newPage()
         if header:
-            paint_sheet_text(p, rect, lay, roll, page, QColor("#000000"))
+            paint_sheet_text(p, rect, lay, roll, page, QColor("#000000"), n)
         first = page * lay.per_page
         rows_here = math.ceil(min(lay.per_page, n - first) / lay.cols) if n else 0
         for k in range(rows_here * lay.cols):
-            i = first + k
             r, c = divmod(k, lay.cols)
             cell = QRectF(lay.x0 + c * lay.cell_w, lay.y0 + r * lay.cell_h, lay.cell_w, lay.cell_h)
-            if i >= n:
+            if first + k >= n:
                 p.fillRect(cell, QColor("#FFFFFF") if ink_saver else C_FILM)
             else:
-                paint_frame_clean(p, cell, lay.rebate_h, i, meta, pixmap_for(roll.frames[i]), ink_saver)
+                i = shown[first + k]
+                fr = roll.frames[i]
+                paint_frame_clean(p, cell, lay.rebate_h, i, meta, pixmap_for(fr), ink_saver, fr if marks else None)
     p.end()
     return lay.pages
 
@@ -2632,7 +2871,12 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._pan_last: Optional[QPointF] = None
         self._last_click_added: Optional[tuple[int, Mark]] = None
         self._click_locked = False
-        self.history: list[tuple[int, Mark]] = []
+        self.undo_ops: list[tuple] = []   # ("add" | "remove" | "edit" | "frame" | "rotate" | "group", ...)
+        self.redo_ops: list[tuple] = []
+        self.filter = "all"
+        self.order: list[int] = []        # frames shown, in sheet order (the filter decides)
+        self._pos: dict[int, int] = {}    # frame index -> position on the sheet
+        self._kbd_nav = False             # last frame choice came from the keyboard
         self._pix_cache: "OrderedDict[Path, QPixmap]" = OrderedDict()
 
         self.setFrameShape(QFrame.NoFrame)
@@ -2738,10 +2982,37 @@ class ContactSheetCanvas(QAbstractScrollArea):
     def on_frame_ready(self, idx: int, thumb: QImage, preview: QImage) -> None:
         if 0 <= idx < len(self.frames):
             fr = self.frames[idx]
-            fr.thumb = QPixmap.fromImage(thumb)
-            fr.preview = preview
-            fr.aspect = max(0.05, preview.width() / max(1, preview.height()))
+            fr.thumb0, fr.preview0 = thumb, preview
+            self._show_rotated(fr)
             self.viewport().update()
+
+    def _show_rotated(self, fr: Frame) -> None:
+        """Display images for the frame's rotation (the file itself is never changed)."""
+        if fr.thumb0 is None or fr.preview0 is None:
+            return
+        t = QTransform().rotate(90 * fr.rotation)
+        thumb = fr.thumb0.transformed(t) if fr.rotation else fr.thumb0
+        fr.preview = fr.preview0.transformed(t) if fr.rotation else fr.preview0
+        fr.thumb = QPixmap.fromImage(thumb)
+        fr.aspect = max(0.05, fr.preview.width() / max(1, fr.preview.height()))
+        self._pix_cache.pop(fr.path, None)
+
+    def _rotate(self, idx: int, steps: int) -> None:
+        fr = self.frames[idx]
+        for _ in range(steps % 4):  # marks turn with the photo: clockwise (x, y) -> (1 - y, x)
+            for mk in fr.marks:
+                mk.pts = [[1.0 - y, x] for x, y in mk.pts]
+        fr.rotation = (fr.rotation + steps) % 4
+        self._show_rotated(fr)
+
+    def rotate_frame(self, steps: int) -> None:
+        idx = self._target_frame()
+        if idx < 0:
+            return
+        self._rotate(idx, steps)
+        self._record(("rotate", idx, steps))
+        self.marksChanged.emit(idx)
+        self.viewport().update()
 
     def toggle_compare(self, on: Optional[bool] = None) -> None:
         want = (not self.compare) if on is None else on
@@ -2766,18 +3037,36 @@ class ContactSheetCanvas(QAbstractScrollArea):
     def grid_top(self) -> int:
         return int(self.viewport().height() * 0.6) if self.compare else 0
 
+    def _refresh_order(self) -> None:
+        self.order = [i for i, fr in enumerate(self.frames) if frame_passes(fr, self.filter)]
+        self._pos = {i: k for k, i in enumerate(self.order)}
+
+    def set_filter(self, key: str) -> None:
+        self.filter = key if key in FILTER_NAMES else "all"
+        self._refresh_order()
+        for name in ("hover_index", "selected"):
+            if getattr(self, name) not in self._pos:
+                setattr(self, name, -1)
+        if self.loupe_locked and self.locked_index not in self._pos:
+            self.loupe_locked = False
+        self.verticalScrollBar().setValue(0)
+        self._update_scrollbar()
+        self.viewport().update()
+
     def _layout(self) -> None:
         vw, vh = self.viewport().width(), self.viewport().height()
         gt = self.grid_top
+        self._refresh_order()
+        n = len(self.order)
         if self.view in PAPER_INCHES:
             # The page exactly as it prints: same paper, margins, header and layout as render_contact_sheet.
-            pw, ph = paper_inches(self.view, len(self.frames), self.print_header)
+            pw, ph = paper_inches(self.view, n, self.print_header)
             area = QRectF(16, gt + 12, vw - 32, vh - gt - 24)
             scale = max(1e-3, min(area.width() / pw, area.height() / ph))
             page = QRectF(area.center().x() - pw * scale / 2, area.center().y() - ph * scale / 2, pw * scale, ph * scale)
             m = SHEET_MARGIN_IN * scale
             inner = page.adjusted(m, m, -m, -m)
-            lay = sheet_layout(inner.width(), inner.height(), len(self.frames), self.print_header)
+            lay = sheet_layout(inner.width(), inner.height(), n, self.print_header)
             self.page_rect, self.page_inner, self.sheet = page, inner, lay
             self.columns = lay.cols
             self.cell_w, self.cell_h, self.rebate_h = lay.cell_w, lay.cell_h, lay.rebate_h
@@ -2793,7 +3082,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
 
     def _update_scrollbar(self) -> None:
         self._layout()
-        rows = math.ceil(len(self.frames) / max(1, self.columns)) if self.frames else 0
+        rows = math.ceil(len(self.order) / max(1, self.columns)) if self.order else 0
         avail = max(1, self.viewport().height() - self.grid_top)
         sb = self.verticalScrollBar()
         content = 0 if self.page_rect is not None else rows * self.cell_h  # a print view always fits
@@ -2806,7 +3095,9 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._update_scrollbar()
 
     def _cell_rect(self, i: int) -> QRectF:
-        row, col = divmod(i, max(1, self.columns))
+        if i not in self._pos:
+            return QRectF(-10000, -10000, self.cell_w, self.cell_h)  # filtered out: off screen
+        row, col = divmod(self._pos[i], max(1, self.columns))
         return QRectF(self.x0 + col * self.cell_w,
                       self.y0 + row * self.cell_h - self.verticalScrollBar().value(),
                       self.cell_w, self.cell_h)
@@ -2826,12 +3117,12 @@ class ContactSheetCanvas(QAbstractScrollArea):
         col = int((pos.x() - self.x0) // self.cell_w)
         if yy < 0 or col < 0 or col >= self.columns:
             return -1
-        idx = row * self.columns + col
-        return idx if 0 <= idx < len(self.frames) else -1
+        k = row * self.columns + col
+        return self.order[k] if 0 <= k < len(self.order) else -1
 
     def loupe_geometry(self, idx: int, locked: bool) -> tuple[QRectF, QRectF]:
         vw, vh = self.viewport().width(), self.viewport().height()
-        frac = 0.92 if locked else 0.55
+        frac = 0.95 if locked else 0.60
         bw, bh = vw * frac, vh * frac
         if locked:
             box = QRectF((vw - bw) / 2, (vh - bh) / 2, bw, bh)
@@ -2918,35 +3209,186 @@ class ContactSheetCanvas(QAbstractScrollArea):
         return pm
 
     # ── mark bookkeeping ───────────────────────────────────────────────────
-    def _add_mark(self, idx: int, mark: Mark) -> None:
-        self.frames[idx].marks.append(mark)
-        self.history.append((idx, mark))
-        self.marksChanged.emit(idx)
-        self.viewport().update()
+    def _record(self, op: tuple) -> None:
+        self.undo_ops.append(op)
+        del self.undo_ops[:-1000]
+        self.redo_ops.clear()
 
-    def _remove_mark(self, idx: int, mark: Mark) -> None:
+    def _insert_mark(self, idx: int, mark: Mark, pos: Optional[int] = None) -> None:
+        marks = self.frames[idx].marks
+        marks.insert(len(marks) if pos is None else min(pos, len(marks)), mark)
+
+    def _delete_mark(self, idx: int, mark: Mark) -> int:
         marks = self.frames[idx].marks
         for j, m in enumerate(marks):
             if m is mark:
                 del marks[j]
-                break
-        self.history = [(i, m) for i, m in self.history if m is not mark]
-        if self.sel is not None and self.sel[1] is mark:
-            self.sel = None
+                if self.sel is not None and self.sel[1] is mark:
+                    self.sel = None
+                return j
+        return -1
+
+    def _add_mark(self, idx: int, mark: Mark) -> None:
+        self._insert_mark(idx, mark)
+        self._record(("add", idx, mark))
+        self.marksChanged.emit(idx)
+        self.viewport().update()
+
+    def _remove_mark(self, idx: int, mark: Mark) -> None:
+        pos = self._delete_mark(idx, mark)
+        if pos >= 0:
+            self._record(("remove", idx, mark, pos))
+        self.marksChanged.emit(idx)
+        self.viewport().update()
+
+    def _retract_add(self, idx: int, mark: Mark) -> None:
+        """Take back a mark placed by accident (first click of a double-click) without an undo step."""
+        self._delete_mark(idx, mark)
+        if self.undo_ops and self.undo_ops[-1][0] == "add" and self.undo_ops[-1][2] is mark:
+            self.undo_ops.pop()
+        self.marksChanged.emit(idx)
+
+    def _apply_op(self, op: tuple, undo: bool) -> int:
+        kind = op[0]
+        if kind == "group":
+            idx = -1
+            for sub in (reversed(op[1]) if undo else op[1]):
+                idx = self._apply_op(sub, undo)
+            return idx
+        idx = op[1]
+        if kind == "add":
+            if undo:
+                self._delete_mark(idx, op[2])
+            else:
+                self._insert_mark(idx, op[2])
+        elif kind == "remove":
+            if undo:
+                self._insert_mark(idx, op[2], op[3])
+            else:
+                self._delete_mark(idx, op[2])
+        elif kind == "edit":
+            pts, size = op[3] if undo else op[4]
+            op[2].pts, op[2].size = [list(q) for q in pts], size
+        elif kind == "frame":
+            fr = self.frames[idx]
+            fr.user_rating, fr.note = op[2] if undo else op[3]
+        elif kind == "rotate":
+            self._rotate(idx, -op[2] if undo else op[2])
+        return idx
+
+    def undo(self) -> None:
+        if not self.undo_ops:
+            self.status.emit("Nothing to undo.")
+            return
+        op = self.undo_ops.pop()
+        idx = self._apply_op(op, undo=True)
+        self.redo_ops.append(op)
+        self.marksChanged.emit(idx)
+        self.viewport().update()
+
+    def redo(self) -> None:
+        if not self.redo_ops:
+            self.status.emit("Nothing to redo.")
+            return
+        op = self.redo_ops.pop()
+        idx = self._apply_op(op, undo=False)
+        self.undo_ops.append(op)
         self.marksChanged.emit(idx)
         self.viewport().update()
 
     def pop_topmost(self, idx: int) -> None:
         if 0 <= idx < len(self.frames) and self.frames[idx].marks:
             self._remove_mark(idx, self.frames[idx].marks[-1])
+        else:
+            self.undo()
+
+    # ── culling: current frame, ratings, rejects, notes ─────────────────────
+    def _target_frame(self) -> int:
+        """Frame a key acts on: the one under the mouse, unless you were just moving with the arrow keys."""
+        if not self._kbd_nav and self.hover_index in self._pos:
+            return self.hover_index
+        if self.selected in self._pos:
+            return self.selected
+        return self.order[0] if self.order else -1
+
+    def _set_frame_state(self, idx: int, rating: Optional[int], note: str) -> None:
+        fr = self.frames[idx]
+        before = (fr.user_rating, fr.note)
+        if before == (rating, note):
             return
-        while self.history:
-            fi, m = self.history[-1]
-            if any(x is m for x in self.frames[fi].marks):
-                self._remove_mark(fi, m)
-                return
-            self.history.pop()
-        self.status.emit("Nothing to undo.")
+        fr.user_rating, fr.note = rating, note
+        self._record(("frame", idx, before, (rating, note)))
+        self.selected = idx
+        self.marksChanged.emit(idx)
+        self.viewport().update()
+
+    def set_rating(self, value: Optional[int]) -> None:
+        idx = self._target_frame()
+        if idx >= 0:
+            self._set_frame_state(idx, value, self.frames[idx].note)
+            self.status.emit(f"Frame {idx + 1}A: " + ("rating cleared" if value is None else f"{value} ★"))
+
+    def toggle_reject(self) -> None:
+        idx = self._target_frame()
+        if idx < 0:
+            return
+        fr = self.frames[idx]
+        rejects = [m for m in fr.marks if m.kind == T_REJECT]
+        if rejects:
+            ops = []
+            for m in rejects:
+                ops.append(("remove", idx, m, self._delete_mark(idx, m)))
+            self._record(("group", ops))
+        else:
+            mk = Mark(T_REJECT, [[0.5, 0.5]], random.getrandbits(31), max(1.5, self.brush_size * 1.5),
+                      self.brush_color, self.brush_style)
+            self._insert_mark(idx, mk)
+            self._record(("add", idx, mk))
+        self.selected = idx
+        self.marksChanged.emit(idx)
+        self.viewport().update()
+
+    def edit_note(self, idx: int = -1) -> None:
+        idx = idx if idx >= 0 else self._target_frame()
+        if idx < 0:
+            return
+        fr = self.frames[idx]
+        text, ok = QInputDialog.getMultiLineText(
+            self, f"Note — frame {idx + 1}A", f"Darkroom note for {fr.name}\n(e.g. grade 3, +½ stop, dodge the sky):",
+            fr.note)
+        if ok:
+            self._set_frame_state(idx, fr.user_rating, text.strip())
+
+    def _navigate(self, key: int) -> None:
+        if not self.order:
+            return
+        k = self._pos.get(self.selected, self._pos.get(self.hover_index, -1))
+        if k < 0:
+            k = 0
+        else:
+            step = {Qt.Key_Left: -1, Qt.Key_Right: 1, Qt.Key_Up: -self.columns, Qt.Key_Down: self.columns}.get(key, 0)
+            if key == Qt.Key_Home:
+                k = 0
+            elif key == Qt.Key_End:
+                k = len(self.order) - 1
+            else:
+                k = min(len(self.order) - 1, max(0, k + step))
+        self.selected = self.order[k]
+        self._kbd_nav = True
+        self.sel = None
+        if self.loupe_locked:  # keep culling in the enlarged view
+            self.locked_index = self.selected
+            self.focus = QPointF(0.5, 0.5)
+        cell = self._cell_rect(self.selected)
+        sb = self.verticalScrollBar()
+        top, bottom = self.grid_top, self.viewport().height()
+        if cell.top() < top:
+            sb.setValue(int(sb.value() - (top - cell.top())))
+        elif cell.bottom() > bottom:
+            sb.setValue(int(sb.value() + (cell.bottom() - bottom)))
+        fr = self.frames[self.selected]
+        self.status.emit(f"Frame {self.selected + 1}A  {fr.name}" + (f"   {fr.rating} ★" if fr.rating > 0 else ""))
+        self.viewport().update()
 
     def _marks_with_drag(self, idx: int) -> list[Mark]:
         marks = list(self.frames[idx].marks)
@@ -2971,24 +3413,28 @@ class ContactSheetCanvas(QAbstractScrollArea):
         p.save()
         p.setClipRect(QRect(0, gt, vw, vh - gt))
         scroll = self.verticalScrollBar().value()
-        rows = math.ceil(len(self.frames) / self.columns)
+        rows = math.ceil(len(self.order) / self.columns)
+        if not self.order:
+            p.setPen(C_AMBER)
+            p.drawText(QRectF(0, gt, vw, vh - gt), Qt.AlignCenter,
+                       f"No frames match “{FILTER_NAMES.get(self.filter, '')}”.  Change Show in the toolbar.")
         if self.page_rect is not None and self.sheet is not None:
             p.fillRect(self.page_rect, QColor("#F4F4F2"))  # the paper
             if self.print_header and self.page_inner is not None:
-                paint_sheet_text(p, self.page_inner, self.sheet, self.roll, 0, QColor("#222222"))
+                paint_sheet_text(p, self.page_inner, self.sheet, self.roll, 0, QColor("#222222"), len(self.order))
         first = max(0, int((scroll - (self.y0 - gt)) // self.cell_h))
         last = int((scroll + vh - self.y0) // self.cell_h) + 1
         if self.page_rect is not None:
             last = min(last, rows - 1)  # nothing below the last row of a printed sheet
         for row in range(first, last + 1):
             for col in range(self.columns):
-                i = row * self.columns + col
-                if i >= len(self.frames):
+                k = row * self.columns + col
+                if k >= len(self.order):
                     cell = QRectF(self.x0 + col * self.cell_w, self.y0 + row * self.cell_h - scroll,
                                   self.cell_w, self.cell_h)
                     p.fillRect(cell, C_FILM)
                     continue
-                self._paint_cell(p, i)
+                self._paint_cell(p, self.order[k])
         p.restore()
         if self.compare:
             self._paint_compare(p, vw)
@@ -3022,12 +3468,16 @@ class ContactSheetCanvas(QAbstractScrollArea):
         if i == self.hover_index and not self.loupe_locked and not self.compare:
             self._ghost(p, img, width)
         self._paint_selection(p, i, img)
+        paint_frame_badges(p, slot, img, fr)
         self._paint_rebate(p, i, cell)
         p.setPen(QPen(QColor("#1C1C1C"), 1))
         p.drawRect(cell.adjusted(0.5, 0.5, -0.5, -0.5))
         if self.compare and i == self.compare_a:
             p.setPen(QPen(C_AMBER, 2))
             p.drawRect(cell.adjusted(1, 1, -1, -1))
+        elif i == self.selected:  # current frame (keyboard culling acts on it)
+            p.setPen(QPen(C_AMBER, 2.5))
+            p.drawRect(cell.adjusted(1.5, 1.5, -1.5, -1.5))
         elif i == self.hover_index and not self.loupe_locked:
             p.setPen(QPen(C_AMBER_DIM, 1.5))
             p.drawRect(cell.adjusted(1, 1, -1, -1))
@@ -3059,6 +3509,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         if locked and box.contains(self.hover_pos):
             self._ghost(p, img, width)
         self._paint_selection(p, idx, img)
+        paint_frame_badges(p, box, img.intersected(box), fr)
         p.setClipping(False)
         label = f"{idx + 1}A  {fr.name}   {self.zoom:.2f}×"
         p.setFont(QFont("DejaVu Sans Mono", 9))
@@ -3194,6 +3645,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
 
     def mouseMoveEvent(self, e) -> None:  # noqa: N802
         pos = e.position()
+        if (pos - self.hover_pos).manhattanLength() > 2:
+            self._kbd_nav = False
         self.hover_pos = QPointF(pos)
         if self._pan_last is not None and self.loupe_locked:
             _box, img = self.loupe_geometry(self.locked_index, True)
@@ -3244,6 +3697,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
             ed = self._edit
             self._edit = None
             if ed["moved"]:
+                mk = ed["mark"]
+                self._record(("edit", ed["idx"], mk, (ed["pts"], ed["size"]), ([list(q) for q in mk.pts], mk.size)))
                 self.marksChanged.emit(ed["idx"])
         if e.button() == Qt.LeftButton and self._drag is not None:
             mark: Mark = self._drag["mark"]
@@ -3281,7 +3736,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         if self._last_click_added is not None:
             fi, mk = self._last_click_added
             if any(m is mk for m in self.frames[fi].marks):
-                self._remove_mark(fi, mk)
+                self._retract_add(fi, mk)
             self._last_click_added = None
         if self._click_locked:
             self.loupe_locked = False
@@ -3311,9 +3766,19 @@ class ContactSheetCanvas(QAbstractScrollArea):
         key, text, mods = e.key(), e.text(), e.modifiers()
         if mods & Qt.ControlModifier:
             if key == Qt.Key_Z:
-                self.pop_topmost(-1)
-                return
-            super().keyPressEvent(e)
+                self.redo() if mods & Qt.ShiftModifier else self.undo()
+            elif key == Qt.Key_Y:
+                self.redo()
+            elif key == Qt.Key_0:
+                self.zoom = 1.0
+                self.viewport().update()
+            elif key in (Qt.Key_BracketRight, Qt.Key_BracketLeft):
+                self.rotate_frame(1 if key == Qt.Key_BracketRight else -1)
+            else:
+                super().keyPressEvent(e)
+            return
+        if mods & Qt.AltModifier and Qt.Key_1 <= key <= Qt.Key_4:
+            self.set_brush_color(BRUSH_COLORS[key - Qt.Key_1][1])
             return
         if self._sel_valid() and self.sel is not None:
             fi, sel_mark = self.sel
@@ -3323,15 +3788,26 @@ class ContactSheetCanvas(QAbstractScrollArea):
             arrows = {Qt.Key_Left: (-1, 0), Qt.Key_Right: (1, 0), Qt.Key_Up: (0, -1), Qt.Key_Down: (0, 1)}
             if key in arrows:
                 step = 0.02 if mods & Qt.ShiftModifier else 0.004
-                move_mark(sel_mark, [list(p) for p in sel_mark.pts], arrows[key][0] * step, arrows[key][1] * step)
+                before = ([list(q) for q in sel_mark.pts], sel_mark.size)
+                move_mark(sel_mark, [list(q) for q in sel_mark.pts], arrows[key][0] * step, arrows[key][1] * step)
+                self._record(("edit", fi, sel_mark, before, ([list(q) for q in sel_mark.pts], sel_mark.size)))
                 self.marksChanged.emit(fi)
                 self.viewport().update()
                 return
+        if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Home, Qt.Key_End):
+            self._navigate(key)
+            return
+        if key == Qt.Key_X and mods & Qt.ShiftModifier:
+            self.toggle_reject()
+            return
+        if text in ("0", "1", "2", "3", "4", "5"):
+            self.set_rating(None if text == "0" else int(text))
+            return
+        if text in ("n", "N"):
+            self.edit_note()
+            return
         if text in ("[", "]"):
             self.set_brush_size(self.brush_size * (1.15 if text == "]" else 1 / 1.15))
-            return
-        if text in ("1", "2", "3", "4"):
-            self.set_brush_color(BRUSH_COLORS[int(text) - 1][1])
             return
         table = {"*": T_STAR, "p": T_STAR, "x": T_REJECT, "+": T_PUSH, "=": T_PUSH, "-": T_PULL,
                  "_": T_PULL, "#": T_CROP, "l": T_LINE, "a": T_ARROW, "r": T_RING, "v": T_INSPECT, "e": T_ADJUST}
@@ -3359,11 +3835,12 @@ class ContactSheetCanvas(QAbstractScrollArea):
         elif key == Qt.Key_Space:
             if self.loupe_locked:
                 self.loupe_locked = False
-            elif self.hover_index >= 0 and not self.compare:
-                self._lock_loupe(self.hover_index, self.hover_pos)
-            self.viewport().update()
-        elif text == "0":
-            self.zoom = 1.0
+            else:
+                idx = self._target_frame()
+                if idx >= 0 and not self.compare:
+                    self.loupe_locked = True
+                    self.locked_index = self.selected = idx
+                    self.focus = QPointF(0.5, 0.5)
             self.viewport().update()
         else:
             super().keyPressEvent(e)
@@ -3383,13 +3860,14 @@ class RollPage(QWidget):
 
     def __init__(self, cfg: ConfigStore, folder: Path, camera: str, film: str, lens: str,
                  marks: Optional[dict[str, list[dict[str, Any]]]], columns: int, view: str, tool: str,
-                 loupe: bool, parent: Optional[QWidget] = None) -> None:
+                 loupe: bool, parent: Optional[QWidget] = None,
+                 extras: Optional[dict[str, dict[str, Any]]] = None) -> None:
         super().__init__(parent)
         self.cfg = cfg
         self.roll = Roll(folder, film, camera, lens)
         self.roll.load_sidecar_marks()
-        if marks:
-            self.roll.apply_marks(marks)
+        if marks or extras:
+            self.roll.apply_marks(marks or {}, extras)
         self.canvas = ContactSheetCanvas(self.roll)
         self.canvas._film_lookup = cfg.film_meta  # type: ignore[method-assign,assignment]
         self.canvas.full_columns = columns
@@ -3418,6 +3896,11 @@ class RollPage(QWidget):
             head.addWidget(QLabel(label))
             head.addWidget(combo)
         head.addStretch(1)
+        self.notes_button = QPushButton("✎ Roll Notes")
+        self.notes_button.setToolTip("Notes for the whole roll (development, paper, ideas); printed in the sheet header")
+        self.notes_button.clicked.connect(self.edit_note)
+        head.addWidget(self.notes_button)
+        head.addSpacing(10)
         head.addWidget(self.info)
         bar = QWidget()
         bar.setStyleSheet("background:#141414;")
@@ -3516,7 +3999,7 @@ class RollPage(QWidget):
         prof = self.cfg.profile
         return SyncJob(fr.path, [m.to_dict() for m in fr.marks], fr.rating, prof.get("artist", ""),
                        prof.get("copyright", ""), self.roll.camera, self.roll.lens,
-                       int(self.cfg.film_meta(self.roll.film).get("iso", 400)), self.roll.film)
+                       int(self.cfg.film_meta(self.roll.film).get("iso", 400)), self.roll.film, fr.extras())
 
     def flush_sync(self, everything: bool = False) -> None:
         if not everything and not self.cfg.setting("sync_enabled"):
@@ -3530,7 +4013,18 @@ class RollPage(QWidget):
 
     def to_session(self) -> dict[str, Any]:
         return {"folder": str(self.roll.folder), "film": self.roll.film, "camera": self.roll.camera,
-                "lens": self.roll.lens, "marks": self.roll.marks_table()}
+                "lens": self.roll.lens, "marks": self.roll.marks_table(), "extras": self.roll.extras_table()}
+
+    def edit_note(self) -> None:
+        text, ok = QInputDialog.getMultiLineText(
+            self, f"Roll notes — {self.roll.folder.name}",
+            "Notes for this roll (developer, time, temperature, paper, printing ideas…):", self.roll.note)
+        if ok:
+            self.roll.note = text.strip()
+            self.roll.save_note()
+            self.notes_button.setText("✎ Roll Notes •" if self.roll.note else "✎ Roll Notes")
+            self.canvas.viewport().update()
+            self.dirty.emit()
 
     def shutdown(self) -> None:
         self.loader.stop()
@@ -3554,7 +4048,7 @@ class MainWindow(QMainWindow):
         self._session_ready = False
 
         self.sync_worker = RapidSyncWorker(self)
-        self.sync_worker.status.connect(lambda m: self.statusBar().showMessage(m, 6000))
+        self.sync_worker.status.connect(self._sync_reported)
         self.sync_worker.start()
 
         self.tabs = QTabWidget()
@@ -3584,17 +4078,36 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         m_file = mb.addMenu("&File")
         self._act(m_file, "Import Roll…", self.import_roll, "Ctrl+O")
+        self.recent_menu = m_file.addMenu("Open Recent")
+        self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
         self._act(m_file, "Close Roll", lambda: self.close_tab(self.tabs.currentIndex()), "Ctrl+W")
         m_file.addSeparator()
         self._act(m_file, "Print Contact Sheet…", self.print_sheet, "Ctrl+P")
         self._act(m_file, "Export Contact Sheet as PDF…", self.export_pdf, "Ctrl+Shift+E")
+        self._act(m_file, "Export Selects…", self.export_selects, "Ctrl+Shift+S")
         m_file.addSeparator()
-        self._act(m_file, "Sync to RapidRAW && Other Apps", self.sync_all, "Ctrl+S")
+        self._act(m_file, "Sync Data", self.sync_all, "Ctrl+S")
         self._act(m_file, "Save Session", self.save_session)
         m_file.addSeparator()
         self._act(m_file, "Settings…", self.open_settings, "Ctrl+,")
         m_file.addSeparator()
         self._act(m_file, "Quit", self.close, "Ctrl+Q")
+        m_edit = mb.addMenu("&Edit")
+        self._act(m_edit, "Undo", lambda: self._canvas_call("undo"), "Ctrl+Z")
+        self._act(m_edit, "Redo", lambda: self._canvas_call("redo"), "Ctrl+Shift+Z")
+        m_frame = mb.addMenu("F&rame")
+        for n in range(1, 6):
+            m_frame.addAction(f"Rate {'★' * n}\t{n}").triggered.connect(lambda _c=False, v=n: self._canvas_call("set_rating", v))
+        m_frame.addAction("Clear Rating\t0").triggered.connect(lambda _c=False: self._canvas_call("set_rating", None))
+        m_frame.addAction("Reject / Un-reject\tShift+X").triggered.connect(lambda _c=False: self._canvas_call("toggle_reject"))
+        m_frame.addSeparator()
+        m_frame.addAction("Edit Frame Note…\tN").triggered.connect(lambda _c=False: self._canvas_call("edit_note"))
+        self._act(m_frame, "Edit Roll Notes…", self.edit_roll_note)
+        m_frame.addSeparator()
+        self._act(m_frame, "Rotate Clockwise", lambda: self._canvas_call("rotate_frame", 1), "Ctrl+]")
+        self._act(m_frame, "Rotate Counter-clockwise", lambda: self._canvas_call("rotate_frame", -1), "Ctrl+[")
+        m_frame.addSeparator()
+        m_frame.addAction("Next / Previous Frame\tArrow keys").setEnabled(False)
         m_view = mb.addMenu("&View")
         self._act(m_view, "Full Screen (F11) / Exit Full Screen", self.toggle_fullscreen, "F11")
         m_eq = mb.addMenu("&Equipment")
@@ -3637,14 +4150,10 @@ class MainWindow(QMainWindow):
         self.loupe_action.triggered.connect(self._loupe_toggled)
         tb.addAction(self.loupe_action)
         self.print_action = QAction("Print Sheet", self)
-        self.print_action.setToolTip("Print a clean, unmarked contact sheet  (Ctrl+P)")
+        self.print_action.setToolTip("Print the contact sheet as shown: View size and Show filter  (Ctrl+P)\n"
+                                     "Settings ▸ Printing: clean sheet or with your marks, ratings and notes")
         self.print_action.triggered.connect(lambda _c=False: self.print_sheet())
         tb.addAction(self.print_action)
-        self.sync_action = QAction("⟳ Sync", self)
-        self.sync_action.setToolTip("Sync marks, ratings, tags and metadata to the sidecars RapidRAW and other\n"
-                                    "workflow apps read, for every frame in every open roll  (Ctrl+S)")
-        self.sync_action.triggered.connect(lambda _c=False: self.sync_all())
-        tb.addAction(self.sync_action)
         tb.addSeparator()
         tb.addWidget(QLabel(" View "))
         self.view_combo = QComboBox()
@@ -3654,6 +4163,13 @@ class MainWindow(QMainWindow):
                                    "Print sizes show the contact sheet exactly as it prints on that paper.")
         self.view_combo.currentIndexChanged.connect(lambda _i: self.set_view(self.view_combo.currentData()))
         tb.addWidget(self.view_combo)
+        tb.addWidget(QLabel(" Show "))
+        self.filter_combo = QComboBox()
+        for key, label in FILTERS:
+            self.filter_combo.addItem(label, key)
+        self.filter_combo.setToolTip("Show only some frames (printing follows this too)")
+        self.filter_combo.currentIndexChanged.connect(lambda _i: self.set_filter(self.filter_combo.currentData()))
+        tb.addWidget(self.filter_combo)
 
         # Second toolbar row: brush size slider + wax colours
         self.addToolBarBreak()
@@ -3694,6 +4210,19 @@ class MainWindow(QMainWindow):
         self.pen_combo.setToolTip("How new marks look: wax pencil, china marker, felt marker or a clean line")
         self.pen_combo.currentIndexChanged.connect(lambda _i: self._apply_brush(style=self.pen_combo.currentData()))
         bb.addWidget(self.pen_combo)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        spacer.setStyleSheet("background: transparent;")
+        bb.addWidget(spacer)
+        self.sync_label = QLabel("Not synced yet")
+        self.sync_label.setStyleSheet("color:#999; padding: 0 8px;")
+        bb.addWidget(self.sync_label)
+        self.sync_button = QPushButton("⟳  Sync Data")
+        self.sync_button.setObjectName("syncButton")
+        self.sync_button.setToolTip("Sync marks, ratings, tags and metadata to the sidecars RapidRAW and other\n"
+                                    "workflow apps read, for every frame in every open roll  (Ctrl+S)")
+        self.sync_button.clicked.connect(self.sync_all)
+        bb.addWidget(self.sync_button)
 
         # Compact-menu mode: every menu collapses into one ☰ button at the start of the toolbar
         self.burger = QMenu(self)
@@ -3817,6 +4346,55 @@ class MainWindow(QMainWindow):
         for page in self.pages():
             page.canvas.set_loupe_enabled(on)
 
+    def _canvas_call(self, name: str, *args: Any) -> None:
+        page = self.current_page()
+        if page is None:
+            self.statusBar().showMessage("Import a roll first.", 4000)
+            return
+        getattr(page.canvas, name)(*args)
+        page.canvas.setFocus()
+
+    def set_filter(self, key: str) -> None:
+        for page in self.pages():
+            page.canvas.set_filter(key)
+        self.mark_dirty()
+
+    def edit_roll_note(self) -> None:
+        page = self.current_page()
+        if page is not None:
+            page.edit_note()
+
+    def _sync_reported(self, message: str) -> None:
+        import datetime
+        self.statusBar().showMessage(message, 8000)
+        self.sync_label.setText("Synced " + datetime.datetime.now().strftime("%H:%M"))
+        self.sync_label.setToolTip(message)
+
+    def _fill_recent_menu(self) -> None:
+        self.recent_menu.clear()
+        folders = [f for f in self.cfg.data.get("recent_folders", []) if Path(f).is_dir()]
+        if not folders:
+            self.recent_menu.addAction("(no recent rolls)").setEnabled(False)
+        for f in folders:
+            self.recent_menu.addAction(f"{Path(f).name}    —    {f}").triggered.connect(
+                lambda _c=False, path=f: self.open_roll(Path(path)))
+        if folders:
+            self.recent_menu.addSeparator()
+            self.recent_menu.addAction("Clear Recent").triggered.connect(self._clear_recent)
+
+    def _clear_recent(self) -> None:
+        self.cfg.data["recent_folders"] = []
+        self.cfg.save()
+
+    def export_selects(self) -> None:
+        page = self.current_page()
+        if page is None:
+            self.statusBar().showMessage("Import a roll first.", 4000)
+            return
+        dlg = ExportSelectsDialog(page.roll, self)
+        if dlg.exec() == QDialog.Accepted:
+            QMessageBox.information(self, "Export Selects", dlg.report)
+
     def set_view(self, view: str) -> None:
         self.view = view if view in PAPER_INCHES else "full"
         self.view_combo.blockSignals(True)
@@ -3848,13 +4426,13 @@ class MainWindow(QMainWindow):
         self.open_roll(path)
 
     def open_roll(self, folder: Path, film: str = "", camera: str = "", lens: str = "",
-                  marks: Optional[dict[str, list[dict[str, Any]]]] = None) -> Optional[RollPage]:
+                  marks: Optional[dict[str, list[dict[str, Any]]]] = None,
+                  extras: Optional[dict[str, dict[str, Any]]] = None) -> Optional[RollPage]:
         prof = self.cfg.profile
         try:
             page = RollPage(self.cfg, folder, camera or prof.get("camera", ""), film or prof.get("film", ""),
                             lens or prof.get("lens", ""), marks, int(self.cfg.setting("default_columns")), self.view,
-                            self.tool,
-                            self.loupe_action.isChecked())
+                            self.tool, self.loupe_action.isChecked(), extras=extras)
         except OSError as exc:
             QMessageBox.warning(self, "Cannot open roll", f"{folder}\n\n{exc}")
             return None
@@ -3862,6 +4440,12 @@ class MainWindow(QMainWindow):
         page.canvas.brush_size = self.brush_size
         page.canvas.brush_color = self.brush_color
         page.canvas.brush_style = self.brush_style
+        page.canvas.set_filter(self.filter_combo.currentData())
+        if page.roll.note:
+            page.notes_button.setText("✎ Roll Notes •")
+        recent = [str(folder)] + [f for f in self.cfg.data.get("recent_folders", []) if f != str(folder)]
+        self.cfg.data["recent_folders"] = recent[:10]
+        self.cfg.save()
         idx = self.tabs.addTab(page, folder.name)
         self.tabs.setCurrentIndex(idx)
         self.mark_dirty()
@@ -3917,20 +4501,25 @@ class MainWindow(QMainWindow):
             "towards the cursor, like a box.  Box, arrow and line stay selected so you can drag\n"
             "their handles.  Adjust tool: click a mark, drag to move, drag handles to resize.\n"
             "Delete removes the selected mark, arrow keys nudge it (Shift = bigger steps), Esc deselects.\n\n"
-            "BRUSH\n[ / ]  Smaller / larger     1-4  Red / Toxic green / Silver / Yellow\n"
+            "BRUSH\n[ / ]  Smaller / larger     Alt+1-4  Red / Toxic green / Silver / Yellow\n"
             "Pen menu: wax pencil, china marker, felt marker or standard line\n\n"
+            "CULLING  (acts on the frame under the mouse, or the highlighted one after arrow keys)\n"
+            "Arrow keys / Home / End  Move between frames     1-5  Rate     0  Clear rating\n"
+            "Shift+X  Reject / un-reject     N  Frame note     Ctrl+] / Ctrl+[  Rotate     Space  Enlarge\n"
+            "Star colours rate too: green 5, red 5, yellow 4, silver 3 (Settings ▸ Files & Sync)\n\n"
             "VIEWING\n"
-            "Hover  loupe beside the frame     Click (Inspect) / Right-click / Space  Enlarge to 92%\n"
-            "View menu  Full screen, or the sheet as it prints on 4×6, 5×7 or 8×10 paper\n"
-            "Ctrl+Wheel  Zoom 0.7×–4.5×     Right-drag  Pan     0  Reset zoom\n"
+            "Hover  loupe beside the frame     Click (Inspect) / Right-click / Space  Enlarge to 95%\n"
+            "View  Full screen, or the sheet as it prints on 4×6, 5×7 or 8×10     Show  filter frames\n"
+            "Ctrl+Wheel  Zoom 0.7×–4.5×     Right-drag  Pan     Ctrl+0  Reset zoom\n"
             "C  2-up compare (hover for [B]); C or Esc exits\n\n"
-            "UNDO\nDouble-click  Pop topmost mark     Ctrl+Z  Pop most recent mark\n\n"
-            "FILE\nCtrl+O Import   Ctrl+P Print   Ctrl+Shift+E Export PDF   Ctrl+, Settings   F11 Full screen"))
+            "UNDO\nCtrl+Z  Undo     Ctrl+Shift+Z  Redo     Double-click  Remove the frame's top mark\n\n"
+            "FILE\nCtrl+O Import   Ctrl+P Print   Ctrl+Shift+E PDF   Ctrl+Shift+S Export selects   Ctrl+S Sync Data\n"
+            "Ctrl+, Settings   F11 Full screen"))
 
     # ── session persistence ────────────────────────────────────────────────
     def save_session(self) -> None:
         state = {"version": 1, "current_tab": self.tabs.currentIndex(), "tool": self.tool,
-                 "view": self.view, "brush_size": self.brush_size,
+                 "view": self.view, "filter": self.filter_combo.currentData(), "brush_size": self.brush_size,
                  "brush_color": self.brush_color, "brush_style": self.brush_style, "rolls": [p.to_session() for p in self.pages()]}
         try:
             atomic_write_json(SESSION_FILE, state)
@@ -3952,6 +4541,7 @@ class MainWindow(QMainWindow):
                 self, "Restore session", "Reopen previous contact sheet session?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes:
             self.set_view(str(state.get("view", "full")))
+            self.filter_combo.setCurrentIndex(max(0, self.filter_combo.findData(state.get("filter", "all"))))
             self._apply_brush(float(state.get("brush_size", 1.0)), state.get("brush_color", DEFAULT_BRUSH_COLOR),
                               str(state.get("brush_style", DEFAULT_PEN)))
             self.set_tool(state.get("tool", T_INSPECT) if state.get("tool") in self.tool_actions else T_INSPECT)
@@ -3959,7 +4549,7 @@ class MainWindow(QMainWindow):
                 folder = Path(r.get("folder", ""))
                 if folder.is_dir():
                     self.open_roll(folder, r.get("film", ""), r.get("camera", ""), r.get("lens", ""),
-                                   r.get("marks"))
+                                   r.get("marks"), r.get("extras"))
             cur = int(state.get("current_tab", 0))
             if 0 <= cur < self.tabs.count():
                 self.tabs.setCurrentIndex(cur)
@@ -3976,7 +4566,7 @@ class MainWindow(QMainWindow):
         if self._session_ready:
             self.save_session()
         for page in self.pages():
-            page.flush_sync()
+            page.flush_sync(everything=bool(self.cfg.setting("sync_on_exit")))
         self.sync_worker.stop()
         self.sync_worker.wait()  # finish writing pending sidecars before quitting
         for page in self.pages():
@@ -4014,7 +4604,9 @@ class MainWindow(QMainWindow):
         self.autosave.setInterval(max(2, int(c.setting("autosave_secs"))) * 1000)
         self.sync_worker.rapidraw_exif = bool(c.setting("rapidraw_exif"))
         self.sync_worker.xmp_sync = bool(c.setting("xmp_sync"))
-        self.sync_worker.star_rating = int(c.setting("star_rating"))
+        STAR_RATINGS.clear()
+        STAR_RATINGS.update(DEFAULT_STAR_RATINGS)
+        STAR_RATINGS.update({str(k).upper(): int(v) for k, v in (c.setting("star_ratings") or {}).items()})
         for page in self.pages():
             page.canvas.print_header = bool(c.setting("print_header"))
             page.canvas.set_columns(int(c.setting("default_columns")))
@@ -4043,7 +4635,7 @@ class MainWindow(QMainWindow):
             printer.setOutputFileName(pdf_path)
         view = page.canvas.view
         if view in PAPER_INCHES:  # same paper, orientation and margins as the screen preview
-            pw, ph = paper_inches(view, len(page.roll.frames), bool(self.cfg.setting("print_header")))
+            pw, ph = paper_inches(view, len(page.canvas.order), bool(self.cfg.setting("print_header")))
             printer.setPageSize(QPageSize(QSizeF(min(pw, ph), max(pw, ph)), QPageSize.Inch,
                                           f"{PAPER_INCHES[view][0]:g}x{PAPER_INCHES[view][1]:g} in"))
             printer.setPageOrientation(QPageLayout.Landscape if pw > ph else QPageLayout.Portrait)
@@ -4060,7 +4652,8 @@ class MainWindow(QMainWindow):
                 printer, page.roll, None if page.canvas.view in PAPER_INCHES else page.canvas.columns,
                 self.cfg.film_meta(page.roll.film),
                 page.canvas.preview_pixmap, bool(self.cfg.setting("print_ink_saver")),
-                bool(self.cfg.setting("print_header")))
+                bool(self.cfg.setting("print_header")), list(page.canvas.order),
+                bool(self.cfg.setting("print_marks")))
         finally:
             QApplication.restoreOverrideCursor()
         self.statusBar().showMessage(f"Contact sheet sent: {pages} page(s)." if pages else
@@ -4073,6 +4666,10 @@ class MainWindow(QMainWindow):
             return None
         if page is None:
             self.statusBar().showMessage("Import a roll first.", 4000)
+            return None
+        page.canvas._refresh_order()
+        if not page.canvas.order:
+            self.statusBar().showMessage("No frames match the Show filter.", 4000)
             return None
         if page.loader.isRunning() and QMessageBox.question(
                 self, "Print", "Some frames are still loading. Print anyway?") != QMessageBox.Yes:
