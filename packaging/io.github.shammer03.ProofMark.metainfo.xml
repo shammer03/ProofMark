@@ -27,6 +27,9 @@
   <url type="homepage">https://github.com/shammer03/ProofMark</url>
   <url type="bugtracker">https://github.com/shammer03/ProofMark/issues</url>
   <releases>
+    <release version="1.4.0" date="2026-10-01">
+      <description><ul><li>New app icon</li><li>Import several rolls at once; Import button and welcome screen</li><li>The wheel scrolls the sheet; Ctrl+wheel zooms</li><li>Show scanned negatives as positives</li><li>Faster reopening of rolls</li></ul></description>
+    </release>
     <release version="1.3.1" date="2026-10-01">
       <description><ul><li>Toolbar icons with hover descriptions</li><li>Double-click removes a mark again in Mark mode</li><li>Save Ink When Printing in the File menu</li><li>Vertical frames lie sideways on printed sheets by default</li></ul></description>
     </release>

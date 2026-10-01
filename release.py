@@ -5,7 +5,7 @@ ProofMark release helper (run from the project folder, no dependencies).
   ./release.py status                      show version, build, channel
   ./release.py bump patch "Fixed X" "Added Y"   bump version (major|minor|patch), build += 1, add changelog lines
   ./release.py build                       build dist/: proofmark.py, .sha256, source tarball (for RPM / Flatpak)
-  ./release.py icon                        export dist/proofmark-512.png (needs PySide6)
+  ./release.py icon                        redraw packaging/proofmark-512.png (needs PySide6)
 
 Typical release:
   ./release.py bump minor "New thing"      # edits proofmark.py, packaging/*.metainfo.xml, *.spec
