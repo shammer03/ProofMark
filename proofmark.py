@@ -56,7 +56,7 @@ from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, Q
                             QTimer, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontMetrics,
                            QIcon, QImage, QPainter, QPainterPath, QPen,
-                           QPixmap, QPolygonF, QTransform)
+                           QPixmap, QPolygonF, QTransform, QRegion, QCursor, QMouseEvent, QWheelEvent)
 from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QComboBox,
                                QCompleter, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
@@ -1273,14 +1273,6 @@ def hull_polygon(rects: list[QRectF]) -> QPolygonF:
     return QPolygonF([QPointF(x, y) for x, y in lower[:-1] + upper[:-1]])
 
 
-def default_box_pts(rect: QRectF, n: list[float], scale: float) -> list[list[float]]:
-    half = 0.15 * min(rect.width(), rect.height()) * max(0.05, scale) ** 0.3  # brush barely changes the default box
-    hx = min(0.49, half / max(1e-6, rect.width()))
-    hy = min(0.49, half / max(1e-6, rect.height()))
-    cx, cy = min(1 - hx, max(hx, n[0])), min(1 - hy, max(hy, n[1]))
-    return [[cx - hx, cy - hy], [cx + hx, cy + hy]]
-
-
 def move_mark(mark: Mark, pts0: list[list[float]], dx: float, dy: float) -> None:
     xs, ys = [p[0] for p in pts0], [p[1] for p in pts0]
     dx = max(-min(xs), min(1.0 - max(xs), dx))
@@ -1328,12 +1320,13 @@ def resize_mark(mark: Mark, rect: QRectF, handle: str, pos: QPointF, orig: dict[
 # How marks grow with the brush size (100% = factor below; the exponent sets how fast it grows).
 # Lines and arrows are thin strokes, so they get the weight; symbols and boxes stay modest so
 # they don't cover the photo.
-GLYPH_K, GLYPH_EXP = 1.4, 0.4                       # star / X / + / - size
+BRUSH_MAX = 2.5                                     # brush slider tops out at 250%
+GLYPH_K, GLYPH_EXP = 1.0, 0.7                       # star / X / + / - size
 STROKE = {"line": (3.6, 0.7), "symbol": (1.8, 0.4)}  # pen thickness: lines & arrows, everything else
 
 
 def glyph_scale(size: float) -> float:
-    """Star / X / + / - size for a brush size (25% ≈ 0.8, 100% = 1.4, 400% ≈ 2.4)."""
+    """Star / X / + / - size for a brush size (25% ≈ 0.4, 100% = 1.0, 250% ≈ 1.9)."""
     return GLYPH_K * max(0.05, size) ** GLYPH_EXP
 
 
@@ -2974,6 +2967,96 @@ def render_contact_sheet(printer: Any, roll: Roll, columns: Optional[int], meta:
     return lay.pages
 
 
+class LoupeOverlay(QWidget):
+    """
+    Draws the 60% and 95% loupe views over the whole window, toolbars included, and hands the mouse
+    to the contact sheet. While enlarged it covers (and dims) everything; for the 60% view it only
+    covers the view itself, so the rest of the window works as usual.
+    """
+
+    def __init__(self, canvas: "ContactSheetCanvas", win: QWidget) -> None:
+        super().__init__(win)
+        self.canvas = canvas
+        self.mode: Optional[str] = None
+        self._mask = QRegion()
+        self.setObjectName("loupeOverlay")
+        self.setStyleSheet("#loupeOverlay { background: transparent; }")
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setMouseTracking(True)
+        self.hide()
+
+    def origin(self) -> QPoint:
+        """Where the contact sheet's viewport starts, in overlay coordinates."""
+        return self.canvas.viewport().mapTo(self.parentWidget(), QPoint(0, 0))
+
+    def sync(self, mode: Optional[str], box: Optional[QRectF]) -> None:
+        self.mode = mode
+        if mode is None:
+            if self.isVisible():
+                self.hide()
+            return
+        win = self.parentWidget()
+        if self.geometry() != win.rect():
+            self.setGeometry(win.rect())
+        if mode == "locked" or box is None:
+            region = QRegion(self.rect())
+        else:
+            o = self.origin()
+            region = QRegion(box.translated(o.x(), o.y()).adjusted(-3, -3, 3, 3).toAlignedRect())
+        if region != self._mask:
+            self._mask = region
+            self.setMask(region)
+        if not self.isVisible():
+            self.show()
+            self.raise_()
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        c = self.canvas
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+        p.translate(QPointF(self.origin()))
+        if self.mode == "locked" and 0 <= c.locked_index < len(c.frames):
+            p.fillRect(c._win_rect(), QColor(0, 0, 0, 175))
+            c._paint_loupe(p, c.locked_index, True)
+        elif self.mode == "hover" and 0 <= c.hover_index < len(c.frames):
+            c._paint_loupe(p, c.hover_index, False)
+        p.end()
+
+    # The mouse goes to the contact sheet, in its viewport coordinates.
+    def _forward(self, e, handler: Callable) -> None:
+        pos = e.position() - QPointF(self.origin())
+        handler(QMouseEvent(e.type(), pos, e.globalPosition(), e.button(), e.buttons(), e.modifiers()))
+        self.setCursor(self.canvas.viewport().cursor())
+
+    def mousePressEvent(self, e) -> None:  # noqa: N802
+        self._forward(e, self.canvas.mousePressEvent)
+
+    def mouseMoveEvent(self, e) -> None:  # noqa: N802
+        self._forward(e, self.canvas.mouseMoveEvent)
+
+    def mouseReleaseEvent(self, e) -> None:  # noqa: N802
+        self._forward(e, self.canvas.mouseReleaseEvent)
+
+    def mouseDoubleClickEvent(self, e) -> None:  # noqa: N802
+        self._forward(e, self.canvas.mouseDoubleClickEvent)
+
+    def wheelEvent(self, e) -> None:  # noqa: N802
+        self.canvas.wheelEvent(QWheelEvent(e.position() - QPointF(self.origin()), e.globalPosition(),
+                                           e.pixelDelta(), e.angleDelta(), e.buttons(), e.modifiers(),
+                                           e.phase(), e.inverted()))
+
+    def leaveEvent(self, e) -> None:  # noqa: N802
+        c = self.canvas
+        vp = c.viewport()
+        if not c.loupe_locked and not vp.rect().contains(vp.mapFromGlobal(QCursor.pos())):
+            c.hover_index = -1
+            vp.update()
+        super().leaveEvent(e)
+
+
 class ContactSheetCanvas(QAbstractScrollArea):
     """
     Edge-to-edge contact sheet with rebate bars, grease marks, loupe and 2-up compare.
@@ -3039,6 +3122,12 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._pos: dict[int, int] = {}    # frame index -> position on the sheet
         self._kbd_nav = False             # last frame choice came from the keyboard
         self._toward_view = False         # cursor came from the hovered frame, may be heading to its view
+        self._overlay: Optional["LoupeOverlay"] = None  # draws the 60% / 95% views over the whole window
+        self._press: Optional[dict[str, Any]] = None          # Mark mode press waiting to become a drag
+        self._pending_click: Optional[dict[str, Any]] = None  # click waiting out the double-click time
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self._mark_mode_click)
         self._pix_cache: "OrderedDict[Path, QPixmap]" = OrderedDict()
 
         self.setFrameShape(QFrame.NoFrame)
@@ -3075,7 +3164,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.viewport().update()
 
     def set_brush_size(self, size: float) -> None:
-        self.brush_size = max(0.25, min(4.0, size))
+        self.brush_size = max(0.25, min(BRUSH_MAX, size))
         self.brushChanged.emit(self.brush_size, self.brush_color)
         self.viewport().update()
 
@@ -3083,23 +3172,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.brush_color = color
         self.brushChanged.emit(self.brush_size, self.brush_color)
         self.viewport().update()
-
-    def _ghost(self, p: QPainter, rect: QRectF, width: float) -> None:
-        """Translucent preview of the mark that a plain click would place."""
-        if self._drag is not None or self._edit is not None:
-            return
-        n = norm_in_rect(rect, self.hover_pos)
-        if self.tool in POINT_TOOLS:
-            mk = Mark(self.tool, [n], 1, self.brush_size, self.brush_color, self.brush_style)
-        elif self.tool in BOX_TOOLS:
-            mk = Mark(self.tool, default_box_pts(rect, n, self.brush_size), 1, self.brush_size, self.brush_color,
-                      self.brush_style)
-        else:
-            return
-        p.save()
-        p.setOpacity(0.45)
-        draw_mark(p, mk, rect, width)
-        p.restore()
 
     def _sel_valid(self) -> bool:
         return self.sel is not None and any(m is self.sel[1] for m in self.frames[self.sel[0]].marks)
@@ -3300,24 +3372,32 @@ class ContactSheetCanvas(QAbstractScrollArea):
         k = row * self.columns + col
         return self.order[k] if 0 <= k < len(self.order) else -1
 
+    def _win_rect(self) -> QRectF:
+        """The whole window in viewport coordinates: loupe sizes are a share of this, toolbars included."""
+        win = self.window()
+        if win is None or win is self:
+            return QRectF(self.viewport().rect())
+        o = self.viewport().mapTo(win, QPoint(0, 0))
+        return QRectF(-o.x(), -o.y(), win.width(), win.height())
+
     def loupe_geometry(self, idx: int, locked: bool) -> tuple[QRectF, QRectF]:
-        vw, vh = self.viewport().width(), self.viewport().height()
+        W = self._win_rect()
         frac = 0.95 if locked else 0.60
-        bw, bh = vw * frac, vh * frac
+        bw, bh = W.width() * frac, W.height() * frac
         if locked:
-            box = QRectF((vw - bw) / 2, (vh - bh) / 2, bw, bh)
+            box = QRectF(W.center().x() - bw / 2, W.center().y() - bh / 2, bw, bh)
         elif self.tool != T_INSPECT:
-            # Mark mode: the 60% view sits in the half of the screen away from the frame, and stays
+            # Mark mode: the 60% view sits in the half of the window away from the frame, and stays
             # when you move onto it (see mouseMoveEvent).
             cell = self._cell_rect(idx)
             gap = 16.0
-            if cell.center().x() < vw / 2:  # frame on the left: view on the right, clear of the frame
-                x = max(cell.right() + gap, vw - bw - 16)
-                w = vw - 16 - x
+            if cell.center().x() < W.center().x():  # frame on the left: view on the right, clear of it
+                x = max(cell.right() + gap, W.right() - bw - 16)
+                w = W.right() - 16 - x
             else:
-                x = 16.0
-                w = min(bw, cell.left() - gap - 16)
-            box = fit_rect(QRectF(x, (vh - bh) / 2, max(60.0, w), bh), self.frames[idx].aspect)
+                x = W.left() + 16
+                w = min(bw, cell.left() - gap - x)
+            box = fit_rect(QRectF(x, W.center().y() - bh / 2, max(60.0, w), bh), self.frames[idx].aspect)
         else:
             box = self._hover_loupe_box(idx, bw, bh)
         base = fit_rect(box, self.frames[idx].aspect)
@@ -3334,16 +3414,17 @@ class ContactSheetCanvas(QAbstractScrollArea):
         Hover loupe right next to the hovered frame, never covering it: try all four sides, keep the
         one that shows the photo largest, and when two are close prefer the one nearer the screen centre.
         """
-        vw, vh = self.viewport().width(), self.viewport().height()
+        W = self._win_rect()  # the whole window, so the view can use the space over the toolbars too
         cell = self._cell_rect(idx)
         aspect = self.frames[idx].aspect
         gap, edge = 12.0, 8.0
-        mid = QPointF(vw / 2, vh / 2)
+        L, T, R, B = W.left() + edge, W.top() + edge, W.right() - edge, W.bottom() - edge
+        mid = W.center()
         regions = {  # free space on each side of the frame
-            "right": QRectF(cell.right() + gap, edge, vw - edge - cell.right() - gap, vh - 2 * edge),
-            "left": QRectF(edge, edge, cell.left() - gap - edge, vh - 2 * edge),
-            "below": QRectF(edge, cell.bottom() + gap, vw - 2 * edge, vh - edge - cell.bottom() - gap),
-            "above": QRectF(edge, edge, vw - 2 * edge, cell.top() - gap - edge),
+            "right": QRectF(cell.right() + gap, T, R - cell.right() - gap, B - T),
+            "left": QRectF(L, T, cell.left() - gap - L, B - T),
+            "below": QRectF(L, cell.bottom() + gap, R - L, B - cell.bottom() - gap),
+            "above": QRectF(L, T, R - L, cell.top() - gap - T),
         }
         options: list[tuple[float, float, QRectF]] = []
         for side, region in regions.items():
@@ -3366,8 +3447,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 close = [o for o in options if o[0] >= 0.8 * biggest]
                 return min(close, key=lambda o: o[1])[2]
         # No room beside the frame (very large cells): use the half of the screen away from the cursor.
-        on_left = cell.center().x() < vw / 2
-        return QRectF(vw - max_w - 16 if on_left else 16, (vh - max_h) / 2, max_w, max_h)
+        on_left = cell.center().x() < mid.x()
+        return QRectF(W.right() - max_w - 16 if on_left else W.left() + 16, mid.y() - max_h / 2, max_w, max_h)
 
     @staticmethod
     def _clamp_axis(c: float, size: float, lo: float, hi: float) -> float:
@@ -3626,13 +3707,35 @@ class ContactSheetCanvas(QAbstractScrollArea):
         p.restore()
         if self.compare:
             self._paint_compare(p, vw)
-        elif self.loupe_locked and 0 <= self.locked_index < len(self.frames):
-            p.fillRect(vp.rect(), QColor(0, 0, 0, 175))
-            self._paint_loupe(p, self.locked_index, True)
-        elif (self.loupe_enabled and self.hover_index >= 0 and self._drag is None
-              and self._edit is None and self._pan_last is None):
-            self._paint_loupe(p, self.hover_index, False)
         p.end()
+        # The 60% / 95% views are drawn by an overlay over the whole window (toolbars included).
+        mode: Optional[str] = None
+        box: Optional[QRectF] = None
+        if not self.compare:
+            if self.loupe_locked and 0 <= self.locked_index < len(self.frames):
+                mode = "locked"
+            elif (self.loupe_enabled and 0 <= self.hover_index < len(self.frames) and self._drag is None
+                  and self._edit is None and self._pan_last is None):
+                mode, box = "hover", self.loupe_geometry(self.hover_index, False)[0]
+        self._sync_overlay(mode, box)
+
+    def _sync_overlay(self, mode: Optional[str], box: Optional[QRectF]) -> None:
+        win = self.window()
+        if win is None or win is self:
+            return
+        if self._overlay is None or self._overlay.parentWidget() is not win:
+            self._overlay = LoupeOverlay(self, win)
+        self._overlay.sync(mode, box)
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        if self._overlay is not None:
+            self._overlay.sync(None, None)  # another tab is showing
+        super().hideEvent(event)
+
+    def _over_overlay(self) -> bool:
+        ov = self._overlay
+        return (ov is not None and ov.isVisible()
+                and ov.mask().contains(ov.mapFromGlobal(QCursor.pos())))
 
     def _paint_cell(self, p: QPainter, i: int) -> None:
         fr = self.frames[i]
@@ -3653,9 +3756,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
         width = max(1.5, img.width() * 0.011)
         for mk in self._marks_with_drag(i):
             draw_mark(p, mk, img, width)
-        if (not self.loupe_locked and not self.compare and img.contains(self.hover_pos)
-                and not self._on_view(self.hover_pos)):
-            self._ghost(p, img, width)  # preview of the next mark, on the frame under the cursor
         self._paint_selection(p, i, img)
         paint_frame_badges(p, slot, img, fr)
         self._paint_rebate(p, i, cell)
@@ -3695,8 +3795,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
         width = max(1.8, img.width() * 0.008)
         for mk in self._marks_with_drag(idx):
             draw_mark(p, mk, img, width)
-        if locked and box.contains(self.hover_pos):
-            self._ghost(p, img, width)
         self._paint_selection(p, idx, img)
         paint_frame_badges(p, box, img.intersected(box), fr)
         p.setClipping(False)
@@ -3747,7 +3845,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         if t == QEvent.Enter:
             self.setFocus()
         elif t == QEvent.Leave:
-            if not self.loupe_locked:
+            if not self.loupe_locked and not self._over_overlay():  # onto the 60% view is not "away"
                 self.hover_index = -1
                 self.viewport().update()
         return super().viewportEvent(event)
@@ -3810,21 +3908,17 @@ class ContactSheetCanvas(QAbstractScrollArea):
             picked = next((m for m in reversed(self.frames[idx].marks) if mark_hit(m, rect, pos)), None)
             if picked is None:
                 self.sel = None
+                self._press = {"idx": idx, "pos": QPointF(pos), "adjust": True}
             else:
                 self.sel = (idx, picked)
                 self._begin_edit(idx, picked, "move", pos, rect)
             self.viewport().update()
             return
         if self.tool in POINT_TOOLS or self.tool in DRAG_TOOLS:
-            # Point marks: click places at the brush size, click-drag outward sizes the mark live.
-            # Box / arrow / line: drag draws it; a plain click on a box tool drops a default box.
+            # Only click-and-drag draws. A press waits: moving past the drag distance starts the mark
+            # at the press point; letting go without moving is a click, which zooms (60% <-> 95%).
             self.sel = None
-            is_point = self.tool in POINT_TOOLS
-            n = norm_in_rect(rect, pos)
-            pts = [n] if (is_point or self.tool == T_LINE) else [n, list(n)]
-            self._drag = {"idx": idx, "point": is_point, "start": QPointF(pos),
-                          "mark": Mark(self.tool, pts, random.getrandbits(31), self.brush_size, self.brush_color,
-                                       self.brush_style)}
+            self._press = {"idx": idx, "pos": QPointF(pos)}
         else:  # Loupe mode: a click switches between the 60% hover view and the 95% enlarged view
             self._last_click_added = None
             if self.loupe_locked:
@@ -3832,6 +3926,17 @@ class ContactSheetCanvas(QAbstractScrollArea):
             else:
                 self._lock_loupe(idx, pos)
                 self._click_locked = True
+        self.viewport().update()
+
+    def _mark_mode_click(self) -> None:
+        """A Mark-mode click (no drag, no double-click): switch 60% <-> 95%, like Loupe mode."""
+        press, self._pending_click = self._pending_click, None
+        if press is None:
+            return
+        if self.loupe_locked:
+            self.loupe_locked = False
+        elif 0 <= press["idx"] < len(self.frames):
+            self._lock_loupe(press["idx"], press["pos"])
         self.viewport().update()
 
     def _lock_loupe(self, idx: int, pos: QPointF) -> None:
@@ -3863,6 +3968,20 @@ class ContactSheetCanvas(QAbstractScrollArea):
             else:
                 resize_mark(mk, rect, ed["mode"], pos, ed)
             ed["moved"] = True
+        elif self._press is not None and not self._press.get("adjust"):
+            start = self._press["pos"]
+            if (pos - start).manhattanLength() >= QApplication.startDragDistance():
+                idx = self._press["idx"]
+                self._press = None
+                rect = self._rect_for(idx)
+                is_point = self.tool in POINT_TOOLS
+                n0 = norm_in_rect(rect, start)
+                pts = [n0] if (is_point or self.tool == T_LINE) else [n0, list(n0)]
+                self._drag = {"idx": idx, "point": is_point, "start": QPointF(start),
+                              "mark": Mark(self.tool, pts, random.getrandbits(31), self.brush_size,
+                                           self.brush_color, self.brush_style)}
+                self.mouseMoveEvent(e)  # draw up to the cursor now
+                return
         elif self._drag is not None:
             rect = self._rect_for(self._drag["idx"])
             n = norm_in_rect(rect, pos)
@@ -3914,6 +4033,11 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.viewport().update()
 
     def mouseReleaseEvent(self, e) -> None:  # noqa: N802
+        if e.button() == Qt.LeftButton and self._press is not None:
+            press, self._press = self._press, None
+            # Wait out the double-click interval: a double-click removes a mark and must not also zoom.
+            self._click_timer.start(QApplication.doubleClickInterval())
+            self._pending_click = press
         if e.button() == Qt.RightButton:
             self._pan_last = None
         if e.button() == Qt.LeftButton and self._edit is not None:
@@ -3937,11 +4061,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
             else:
                 a, b = mark.pts[0], mark.pts[1]
                 diag = math.hypot((b[0] - a[0]) * rect.width(), (b[1] - a[1]) * rect.height())
-                if mark.kind in BOX_TOOLS and diag < 8.0:
-                    mark.pts = default_box_pts(rect, a, self.brush_size)  # plain click: default box
-                    valid = True
-                else:
-                    valid = diag > 6.0
+                valid = diag > 6.0  # only a real drag draws
             if valid:
                 self._add_mark(idx, mark)
                 self._last_click_added = (idx, mark)
@@ -3962,6 +4082,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
             if any(m is mk for m in self.frames[fi].marks):
                 self._retract_add(fi, mk)
             self._last_click_added = None
+        self._click_timer.stop()  # this was a double-click, not a click
+        self._pending_click = None
         if self._click_locked or self.tool == T_INSPECT:
             # The first click already switched the view (Loupe mode, or the 60% view): nothing more.
             self._click_locked = False
@@ -3983,7 +4105,19 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 over_view = self.loupe_geometry(self.locked_index, True)[0].contains(pos)
             else:
                 over_view = self._on_view(pos)
-        if over_view or e.modifiers() & Qt.ControlModifier:
+        loupe_showing = self.loupe_locked or (self.loupe_enabled and self.hover_index >= 0)
+        if self.tool == T_INSPECT and loupe_showing and not self.compare:
+            over_view = True  # Loupe mode: the wheel always zooms the loupe, enlarged or not
+        if e.modifiers() & Qt.ShiftModifier:  # Shift+wheel always scrolls the contact sheet
+            d = e.angleDelta()
+            delta = d.y() or d.x()  # some systems turn Shift+wheel into a sideways scroll
+            sb = self.verticalScrollBar()
+            sb.setValue(sb.value() - int(delta / 120 * sb.singleStep() * 3))
+            e.accept()
+            return
+        elif e.modifiers() & Qt.ControlModifier:
+            over_view = True
+        if over_view:
             idx = self.locked_index if self.loupe_locked else self.hover_index
             if idx >= 0 and not self.compare:
                 rect = self._rect_for(idx)
@@ -4482,7 +4616,7 @@ class MainWindow(QMainWindow):
         bb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         bb.addWidget(QLabel("Brush size"))
         self.size_slider = JumpSlider(Qt.Horizontal)
-        self.size_slider.setRange(25, 400)
+        self.size_slider.setRange(25, int(BRUSH_MAX * 100))
         self.size_slider.setValue(100)
         self.size_slider.setFixedWidth(220)
         self.size_slider.setToolTip("Mark / brush size  ( [ smaller   ] larger )")
@@ -4568,7 +4702,7 @@ class MainWindow(QMainWindow):
     def _apply_brush(self, size: Optional[float] = None, color: Optional[str] = None,
                      style: Optional[str] = None) -> None:
         if size is not None:
-            self.brush_size = max(0.25, min(4.0, size))
+            self.brush_size = max(0.25, min(BRUSH_MAX, size))
         if color is not None and color in self.color_actions:
             self.brush_color = color
         if style is not None and style in PEN_NAMES:
