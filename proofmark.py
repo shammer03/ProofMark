@@ -1321,6 +1321,25 @@ def resize_mark(mark: Mark, rect: QRectF, handle: str, pos: QPointF, orig: dict[
 # Lines and arrows are thin strokes, so they get the weight; symbols and boxes stay modest so
 # they don't cover the photo.
 BRUSH_MAX = 2.5                                     # brush slider tops out at 250%
+BRUSH_DETENTS = [25, 50, 75, 100, 150, 200, 250]   # brush slider stops (percent)
+# Loupe magnification, as a share of the window: the view grows from 60% to 95% (fit), then the
+# photo inside it is magnified up to 200% (0.95 x 2).
+LOUPE_HOVER, LOUPE_FIT, LOUPE_MAX = 0.60, 0.95, 1.90
+ZOOM_DETENTS = [0.60, 0.75, 0.95, 0.95 * 1.5, 1.90]  # wheel pauses here for one notch
+
+
+def snap_detent(old: float, new: float, detents: list[float]) -> float:
+    """Stop on the first detent crossed between old and new; the next step carries on past it."""
+    if new > old:
+        for d in sorted(detents):
+            if old < d < new:
+                return d
+    elif new < old:
+        for d in sorted(detents, reverse=True):
+            if new < d < old:
+                return d
+    return new
+
 GLYPH_K, GLYPH_EXP = 1.0, 0.7                       # star / X / + / - size
 STROKE = {"line": (3.6, 0.7), "symbol": (1.8, 0.4)}  # pen thickness: lines & arrows, everything else
 
@@ -2400,7 +2419,23 @@ class UpdateDialog(QDialog):
 
 
 class JumpSlider(QSlider):
-    """A slider that jumps straight to where you click (instead of stepping towards it), then drags."""
+    """
+    A slider that jumps straight to where you click (instead of stepping towards it), then drags.
+    It has detents: a click within 8 of a stop lands on it, and dragging pauses within 4 of one.
+    """
+
+    detents: list[int] = []
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self.sliderMoved.connect(lambda v: self._snap(v, 4))
+
+    def _snap(self, value: int, tolerance: int) -> int:
+        near = min(self.detents, key=lambda d: abs(d - value)) if self.detents else value
+        if abs(near - value) <= tolerance and near != value:
+            self.setValue(near)
+            return near
+        return value
 
     def mousePressEvent(self, e) -> None:  # noqa: N802
         if e.button() == Qt.LeftButton:
@@ -2411,8 +2446,8 @@ class JumpSlider(QSlider):
                 groove = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
                 x = int(e.position().x()) - groove.x() - handle.width() // 2
                 span = max(1, groove.width() - handle.width())
-                self.setValue(QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), x, span,
-                                                             opt.upsideDown))
+                v = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), x, span, opt.upsideDown)
+                self.setValue(self._snap(v, 8))
         super().mousePressEvent(e)  # now on the handle, so a drag carries on from here
 
 
@@ -3104,7 +3139,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.selected = -1
         self.loupe_locked = False
         self.locked_index = -1
-        self.zoom = 1.0
+        self.mag = LOUPE_FIT  # enlarged view: share of the window (photo zoom above LOUPE_FIT)
         self.focus = QPointF(0.5, 0.5)
         self.compare = False
         self.compare_a = -1
@@ -3164,7 +3199,9 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.viewport().update()
 
     def set_brush_size(self, size: float) -> None:
-        self.brush_size = max(0.25, min(BRUSH_MAX, size))
+        size = max(0.25, min(BRUSH_MAX, size))
+        near = min(BRUSH_DETENTS, key=lambda d: abs(d - size * 100))
+        self.brush_size = near / 100 if abs(near - size * 100) <= 4 else size
         self.brushChanged.emit(self.brush_size, self.brush_color)
         self.viewport().update()
 
@@ -3380,9 +3417,14 @@ class ContactSheetCanvas(QAbstractScrollArea):
         o = self.viewport().mapTo(win, QPoint(0, 0))
         return QRectF(-o.x(), -o.y(), win.width(), win.height())
 
+    @property
+    def zoom(self) -> float:
+        """Photo magnification inside the enlarged view (1.0 = fits the 95% window)."""
+        return max(1.0, self.mag / LOUPE_FIT) if self.loupe_locked else 1.0
+
     def loupe_geometry(self, idx: int, locked: bool) -> tuple[QRectF, QRectF]:
         W = self._win_rect()
-        frac = 0.95 if locked else 0.60
+        frac = min(self.mag, LOUPE_FIT) if locked else LOUPE_HOVER
         bw, bh = W.width() * frac, W.height() * frac
         if locked:
             box = QRectF(W.center().x() - bw / 2, W.center().y() - bh / 2, bw, bh)
@@ -3798,7 +3840,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._paint_selection(p, idx, img)
         paint_frame_badges(p, box, img.intersected(box), fr)
         p.setClipping(False)
-        label = f"{idx + 1}A  {fr.name}   {self.zoom:.2f}×"
+        size = f"{round(min(self.mag, LOUPE_FIT) * 100)}%" if locked else f"{round(LOUPE_HOVER * 100)}%"
+        label = f"{idx + 1}A  {fr.name}   {size}" + (f"  ·  {self.zoom * 100:.0f}%" if self.zoom > 1.0 else "")
         p.setFont(QFont("DejaVu Sans Mono", 9))
         p.fillRect(QRectF(box.x(), box.y(), QFontMetrics(p.font()).horizontalAdvance(label) + 14, 20),
                    QColor(0, 0, 0, 200))
@@ -3876,6 +3919,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 self.viewport().update()
             return
         if self._on_view(pos):  # click on the 60% view: enlarge to 95%
+            self.mag = LOUPE_FIT
             self.loupe_locked = True
             self.locked_index = self.selected = self.hover_index
             self._click_locked = True
@@ -3940,6 +3984,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.viewport().update()
 
     def _lock_loupe(self, idx: int, pos: QPointF) -> None:
+        self.mag = LOUPE_FIT  # a click enlarges straight to 95%
         self.loupe_locked = True
         self.locked_index = idx
         self.selected = idx
@@ -4021,8 +4066,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
                                          min(1.0, max(0.0, (pos.y() - box.y()) / max(1.0, box.height()))))
             else:
                 i = self.cell_at(pos)
-                if i != self.hover_index:
-                    self.zoom = 1.0  # a new frame starts unzoomed
                 self.hover_index = i
                 self._toward_view = i >= 0  # on a frame: you may now head for its view
                 if i >= 0:
@@ -4119,13 +4162,29 @@ class ContactSheetCanvas(QAbstractScrollArea):
             over_view = True
         if over_view:
             idx = self.locked_index if self.loupe_locked else self.hover_index
-            if idx >= 0 and not self.compare:
+            steps = e.angleDelta().y() / 120.0
+            if idx >= 0 and not self.compare and steps:
+                if not self.loupe_locked:
+                    if steps < 0:
+                        e.accept()
+                        return
+                    # Zooming the 60% view turns it into the enlarged view, growing from 60%.
+                    self.loupe_locked = True
+                    self.locked_index = self.selected = idx
+                    self.mag = LOUPE_HOVER
+                elif steps < 0 and self.mag <= LOUPE_HOVER + 1e-6:
+                    self.loupe_locked = False  # wheeled all the way back: the 60% view again
+                    self.viewport().update()
+                    e.accept()
+                    return
                 rect = self._rect_for(idx)
-                if self.loupe_locked and rect.contains(pos):
+                if rect.contains(pos):  # magnify towards the point under the cursor
                     n = norm_in_rect(rect, pos)
                     self.focus = QPointF(n[0], n[1])
-                steps = e.angleDelta().y() / 120.0
-                self.zoom = max(0.7, min(4.5, self.zoom * (1.15 ** steps)))
+                new = min(LOUPE_MAX, max(LOUPE_HOVER, self.mag * (1.12 ** steps)))
+                self.mag = snap_detent(self.mag, new, ZOOM_DETENTS)
+                self.status.emit(f"Loupe {round(min(self.mag, LOUPE_FIT) * 100)}% of the window"
+                                 + (f"  ·  photo {self.zoom * 100:.0f}%" if self.zoom > 1.0 else ""))
                 self.viewport().update()
             e.accept()
             return
@@ -4142,7 +4201,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
             elif key == Qt.Key_Y:
                 self.redo()
             elif key == Qt.Key_0:
-                self.zoom = 1.0
+                self.mag = LOUPE_FIT
                 self.viewport().update()
             elif key in (Qt.Key_BracketRight, Qt.Key_BracketLeft):
                 self.rotate_frame(1 if key == Qt.Key_BracketRight else -1)
@@ -4617,6 +4676,7 @@ class MainWindow(QMainWindow):
         bb.addWidget(QLabel("Brush size"))
         self.size_slider = JumpSlider(Qt.Horizontal)
         self.size_slider.setRange(25, int(BRUSH_MAX * 100))
+        self.size_slider.detents = BRUSH_DETENTS
         self.size_slider.setValue(100)
         self.size_slider.setFixedWidth(220)
         self.size_slider.setToolTip("Mark / brush size  ( [ smaller   ] larger )")
