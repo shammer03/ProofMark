@@ -63,7 +63,7 @@ from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QComboBox,
                                QInputDialog, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMainWindow, QMenu,
                                QMessageBox, QPushButton, QRadioButton, QSizePolicy, QSlider, QSpinBox,
-                               QSystemTrayIcon, QTabWidget,
+                               QStyle, QStyleOptionSlider, QSystemTrayIcon, QTabWidget,
                                QVBoxLayout, QWidget)
 
 Image.MAX_IMAGE_PIXELS = None
@@ -1297,18 +1297,21 @@ def resize_mark(mark: Mark, rect: QRectF, handle: str, pos: QPointF, orig: dict[
         mark.pts = out
 
 
+GLYPH_K, STROKE_K = 2.2, 3.0  # how big 100% is: symbols and pen thickness
+
+
 def glyph_scale(size: float) -> float:
     """Star / X / + / - size for a brush size: 25% still reads, 400% is big without filling the frame."""
-    return 1.6 * max(0.05, size) ** 0.6
+    return GLYPH_K * max(0.05, size) ** 0.6
 
 
 def size_for_glyph(scale: float) -> float:
-    return (max(1e-3, scale) / 1.6) ** (1 / 0.6)
+    return (max(1e-3, scale) / GLYPH_K) ** (1 / 0.6)
 
 
 def stroke_scale(size: float) -> float:
     """Pen thickness for a brush size: 100% draws a solid line, 25% stays visible, 400% is bold (not huge)."""
-    return 2.0 * max(0.05, size) ** 0.6
+    return STROKE_K * max(0.05, size) ** 0.6
 
 
 def draw_mark(painter: QPainter, mark: Mark, rect: QRectF, width: float) -> None:
@@ -2367,6 +2370,23 @@ class UpdateDialog(QDialog):
         row.addWidget(page)
         row.addWidget(later)
         lay.addLayout(row)
+
+
+class JumpSlider(QSlider):
+    """A slider that jumps straight to where you click (instead of stepping towards it), then drags."""
+
+    def mousePressEvent(self, e) -> None:  # noqa: N802
+        if e.button() == Qt.LeftButton:
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            handle = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+            if not handle.contains(e.position().toPoint()):
+                groove = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
+                x = int(e.position().x()) - groove.x() - handle.width() // 2
+                span = max(1, groove.width() - handle.width())
+                self.setValue(QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), x, span,
+                                                             opt.upsideDown))
+        super().mousePressEvent(e)  # now on the handle, so a drag carries on from here
 
 
 class FavCombo(QComboBox):
@@ -4352,7 +4372,7 @@ class MainWindow(QMainWindow):
         bb.setMovable(False)
         bb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         bb.addWidget(QLabel("Brush size"))
-        self.size_slider = QSlider(Qt.Horizontal)
+        self.size_slider = JumpSlider(Qt.Horizontal)
         self.size_slider.setRange(25, 400)
         self.size_slider.setValue(100)
         self.size_slider.setFixedWidth(220)
