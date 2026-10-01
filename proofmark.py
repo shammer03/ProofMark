@@ -58,14 +58,14 @@ from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, Q
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontMetrics,
                            QIcon, QImage, QPainter, QPainterPath, QPen,
                            QPixmap, QTransform, QRegion, QCursor, QMouseEvent, QWheelEvent)
-from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QComboBox,
+from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QApplication, QComboBox,
                                QCompleter, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMainWindow, QMenu,
                                QMessageBox, QProgressDialog, QPushButton, QRadioButton, QSizePolicy, QSlider,
                                QSpinBox,
-                               QStyle, QStyleOptionSlider, QSystemTrayIcon, QTabWidget,
+                               QStackedWidget, QStyle, QStyleOptionSlider, QSystemTrayIcon, QTabWidget,
                                QVBoxLayout, QWidget)
 
 Image.MAX_IMAGE_PIXELS = None
@@ -1497,6 +1497,11 @@ QPushButton { background: #1b1b1b; color: #FFFFFF; border: 1px solid #333; paddi
 QPushButton:hover { border-color: #FFA726; color: #FFA726; }
 QPushButton#syncButton { background: #FFA726; color: #000000; font-weight: bold; padding: 6px 18px; border: none; }
 QPushButton#syncButton:hover { background: #FFFFFF; color: #000000; }
+QToolButton#importButton { border: 1px solid #FFA726; font-weight: bold; padding: 5px 12px; }
+QPushButton#welcomeImport { background: #FFA726; color: #000000; font-weight: bold; font-size: 15pt;
+    padding: 14px 34px; border: none; border-radius: 6px; }
+QPushButton#welcomeImport:hover { background: #FFFFFF; }
+QPushButton#recentRoll { text-align: left; padding: 8px 14px; }
 QComboBox, QLineEdit, QSpinBox, QListWidget { background: #141414; color: #FFFFFF; border: 1px solid #333;
     padding: 4px 6px; selection-background-color: #FFA726; selection-color: #000000; }
 QComboBox QAbstractItemView { background: #141414; color: #FFFFFF; selection-background-color: #FFA726; selection-color: #000; }
@@ -2437,6 +2442,68 @@ class SettingsDialog(QDialog):
             self.cfg.set_setting(key, value)
         self.cfg.save()
         self.accept()
+
+
+class WelcomePage(QWidget):
+    """Shown while no roll is open: a big Import button, recent rolls, and a drop hint."""
+
+    def __init__(self, win: "MainWindow") -> None:
+        super().__init__()
+        self.win = win
+        lay = QVBoxLayout(self)
+        lay.addStretch(2)
+        title = QLabel("ProofMark")
+        title.setObjectName("amber")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 30pt; letter-spacing: 2px;")
+        sub = QLabel("Darkroom contact-sheet proofing")
+        sub.setAlignment(Qt.AlignCenter)
+        sub.setStyleSheet("color:#999; font-size: 12pt;")
+        self.import_btn = QPushButton("  Import Rolls…")
+        self.import_btn.setObjectName("welcomeImport")
+        ic = tool_icon("adw:folder-open")
+        if ic is not None:
+            self.import_btn.setIcon(ic.pixmap(QSize(24, 24), QIcon.Normal, QIcon.On))
+            self.import_btn.setIconSize(QSize(24, 24))
+        self.import_btn.clicked.connect(win.import_roll)
+        hint = QLabel("Pick one or more roll folders (Ctrl / Shift for several), or drop folders anywhere on this window")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setStyleSheet("color:#888;")
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(self.import_btn)
+        row.addStretch(1)
+        self.recent_title = QLabel("Recent rolls")
+        self.recent_title.setAlignment(Qt.AlignCenter)
+        self.recent_title.setStyleSheet("color:#bbb; font-weight: bold; margin-top: 18px;")
+        self.recent_box = QVBoxLayout()
+        recent_row = QHBoxLayout()
+        recent_row.addStretch(1)
+        recent_row.addLayout(self.recent_box)
+        recent_row.addStretch(1)
+        for w in (title, sub):
+            lay.addWidget(w)
+        lay.addSpacing(26)
+        lay.addLayout(row)
+        lay.addSpacing(8)
+        lay.addWidget(hint)
+        lay.addWidget(self.recent_title)
+        lay.addLayout(recent_row)
+        lay.addStretch(3)
+
+    def refresh(self) -> None:
+        while self.recent_box.count():
+            item = self.recent_box.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        folders = [f for f in self.win.cfg.data.get("recent_folders", []) if Path(f).is_dir()][:6]
+        self.recent_title.setVisible(bool(folders))
+        for f in folders:
+            b = QPushButton(f"{Path(f).name}     —     {f}")
+            b.setObjectName("recentRoll")
+            b.setMinimumWidth(520)
+            b.clicked.connect(lambda _c=False, path=f: self.win.open_roll(Path(path)))
+            self.recent_box.addWidget(b)
 
 
 class RollInfoDialog(QDialog):
@@ -3632,7 +3699,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
       hover            -> 60% view beside the frame
       click            -> switch 60% / 95% enlarged view; right-click / Space too
       double-click     -> Mark mode: remove that photo's newest mark (the click's zoom is taken back)
-      wheel            -> while a view shows: grow it to 95%, then magnify the photo to 200%
+      wheel            -> scroll the sheet; Ctrl+wheel (or any wheel in the 95% view) zooms the loupe
       drag (Mark mode) -> draw a mark from the press point
       drag (Loupe mode)/right-drag -> move a magnified photo
       Delete           -> remove the selected mark, else the newest mark on the photo under the cursor
@@ -4765,22 +4832,17 @@ class ContactSheetCanvas(QAbstractScrollArea):
 
     def wheelEvent(self, e) -> None:  # noqa: N802
         pos = e.position()
-        over_view = False  # cursor on the 60% view or the 95% enlarged view: the wheel zooms
-        if not self.compare:
-            if self.loupe_locked:
-                over_view = self.loupe_geometry(self.locked_index, True)[0].contains(pos)
-        loupe_showing = self.loupe_locked or (self.loupe_enabled and self.hover_index >= 0)
-        if loupe_showing and not self.compare:
-            over_view = True  # both modes alike: while a loupe is showing, the wheel zooms it
-        if e.modifiers() & Qt.ShiftModifier:  # Shift+wheel always scrolls the contact sheet
+        # The usual convention: the wheel scrolls the contact sheet, Ctrl+wheel zooms the loupe.
+        # In the 95% enlarged view there is nothing behind to scroll, so there the wheel zooms.
+        # Shift+wheel always scrolls. Same in Loupe and Mark mode.
+        if e.modifiers() & Qt.ShiftModifier:
             d = e.angleDelta()
             delta = d.y() or d.x()  # some systems turn Shift+wheel into a sideways scroll
             sb = self.verticalScrollBar()
             sb.setValue(sb.value() - int(delta / 120 * sb.singleStep() * 3))
             e.accept()
             return
-        elif e.modifiers() & Qt.ControlModifier:
-            over_view = True
+        over_view = not self.compare and (self.loupe_locked or bool(e.modifiers() & Qt.ControlModifier))
         if over_view:
             idx = self.locked_index if self.loupe_locked else self.hover_index
             steps = e.angleDelta().y() / 120.0
@@ -5177,14 +5239,15 @@ KEYS_TEXT = (
     "VIEWING  (the same in Loupe and Mark mode)\n"
     "Hover  60% view beside the frame     Click  60% / 95%     Esc  Back\n"
     "Mark mode: double-click a photo  Remove its newest mark (again for the one before)\n"
-    "Wheel  Grow the view to 95%, then magnify the photo to 200% (stops at 75 / 95 / 150 / 200%)\n"
-    "Shift+Wheel  Scroll the sheet     Drag (Loupe) / right-drag  Move a magnified photo     Ctrl+0  Back to 95%\n"
+    "Wheel  Scroll the sheet     Ctrl+Wheel  Grow the view to 95%, then magnify the photo to 200%\n"
+    "In the 95% view the wheel zooms (stops at 75 / 95 / 150 / 200%)     Ctrl+0  Back to 95%\n"
+    "Drag (Loupe) / right-drag  Move a magnified photo\n"
     "View  Full screen, or the sheet as it prints on 4×6, 5×7 or 8×10     Show  filter frames\n"
     "C  2-up compare (hover for [B]); C or Esc exits\n\n"
     "UNDO\nCtrl+Z / ↶ Undo     Ctrl+Shift+Z / ↷ Redo\n"
     "Delete  Remove the selected mark, or the newest mark on the photo under the cursor\n\n"
     "FILE\nCtrl+O Import   Ctrl+P Print   Ctrl+Shift+E PDF   Ctrl+Alt+E Image   Ctrl+Shift+S Export selects\n"
-    "Ctrl+S Sync Data   Drop folders or photos on the window to open / add them\n"
+    "Ctrl+S Sync Data   Import: pick several roll folders with Ctrl / Shift, or drop folders on the window\n"
     "Ctrl+, Settings   F11 Full screen")
 
 
@@ -5214,8 +5277,12 @@ class MainWindow(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
         self.tabs.currentChanged.connect(self._tab_changed)
-        self.setCentralWidget(self.tabs)
-        self.statusBar().showMessage("Import a roll to begin  (File ▸ Import Roll…, Ctrl+O)")
+        self.welcome = WelcomePage(self)
+        self.central = QStackedWidget()
+        self.central.addWidget(self.welcome)
+        self.central.addWidget(self.tabs)
+        self.setCentralWidget(self.central)
+        self.statusBar().showMessage("Click Import (Ctrl+O) to open one or more rolls, or drop folders on the window")
         self.brush_size = 1.0
         self.brush_color = DEFAULT_BRUSH_COLOR
         self.brush_style = DEFAULT_PEN
@@ -5229,6 +5296,7 @@ class MainWindow(QMainWindow):
         self.autosave.timeout.connect(self._autosave_tick)
         self.autosave.start()
         self.statusBar().addPermanentWidget(QLabel(f"v{version_string()}  "))
+        self._refresh_central()  # the welcome page until a roll is open
         if not self.cfg.data.get("sideways_default_on"):  # 1.3.1: lay vertical frames sideways by default
             self.cfg.set_setting("sideways_verticals", True)
             self.cfg.data["sideways_default_on"] = True
@@ -5251,7 +5319,7 @@ class MainWindow(QMainWindow):
     def _build_actions(self) -> None:
         mb = self.menuBar()
         m_file = mb.addMenu("&File")
-        self._act(m_file, "Import Roll…", self.import_roll, "Ctrl+O")
+        self._act(m_file, "Import Rolls…", self.import_roll, "Ctrl+O")
         self.recent_menu = m_file.addMenu("Open Recent")
         self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
         self._act(m_file, "Close Roll", lambda: self.close_tab(self.tabs.currentIndex()), "Ctrl+W")
@@ -5495,6 +5563,18 @@ class MainWindow(QMainWindow):
         btn.setPopupMode(QToolButton.InstantPopup)
         btn.setMenu(self.burger)
         self.menu_button_action = tb.insertWidget(self.tool_actions[T_INSPECT], btn)
+        imp = QToolButton()
+        imp.setObjectName("importButton")
+        imp.setText("Import")
+        _ic = tool_icon("adw:folder-open")
+        if _ic is not None:
+            imp.setIcon(_ic)
+        imp.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        imp.setToolTip("Import rolls: pick one or more roll folders (Ctrl / Shift for several)  (Ctrl+O)\n"
+                       "You can also drop folders onto the window")
+        imp.clicked.connect(self.import_roll)
+        tb.insertWidget(self.tool_actions[T_INSPECT], imp)
+        tb.insertSeparator(self.tool_actions[T_INSPECT])
         self.menu_button_action.setVisible(False)
 
     @staticmethod
@@ -5749,18 +5829,48 @@ class MainWindow(QMainWindow):
         self.mark_dirty()
 
     # ── roll management ────────────────────────────────────────────────────
-    def import_roll(self) -> None:
+    def _refresh_central(self) -> None:
+        """The welcome page while no roll is open, the roll tabs otherwise."""
+        if self.tabs.count():
+            self.central.setCurrentWidget(self.tabs)
+        else:
+            self.welcome.refresh()
+            self.central.setCurrentWidget(self.welcome)
+
+    def roll_folder_dialog(self) -> QFileDialog:
+        """Folder picker that takes several roll folders at once (Ctrl / Shift)."""
         start = self.cfg.data.get("last_import_parent") or str(Path.home() / "Pictures")
         if not Path(start).is_dir():
             start = str(Path.home())
-        # Opens the PARENT directory holding your roll folders, not inside an active roll.
-        folder = QFileDialog.getExistingDirectory(self, "Import Roll — choose a roll folder", start)
-        if not folder:
+        dlg = QFileDialog(self, "Import Rolls — pick one or more roll folders (Ctrl / Shift for several)", start)
+        dlg.setFileMode(QFileDialog.Directory)
+        dlg.setOption(QFileDialog.ShowDirsOnly, True)
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)  # the desktop's own picker allows only one folder
+        for view in dlg.findChildren(QAbstractItemView):
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        dlg.setLabelText(QFileDialog.Accept, "Import")
+        return dlg
+
+    def import_roll(self) -> None:
+        dlg = self.roll_folder_dialog()
+        if dlg.exec() != QDialog.Accepted:
             return
-        path = Path(folder)
-        self.cfg.data["last_import_parent"] = str(path.parent)
+        self.import_folders([Path(f) for f in dlg.selectedFiles()])
+
+    def import_folders(self, folders: list[Path]) -> None:
+        folders = [f for f in dict.fromkeys(folders) if f.is_dir()]
+        if not folders:
+            return
+        # Next time, start in the folder that holds these rolls (not inside one of them).
+        self.cfg.data["last_import_parent"] = str(folders[0].parent)
         self.cfg.save()
-        self.open_roll(path)
+        open_now = {str(p.roll.folder.resolve()) for p in self.pages()}
+        for folder in folders:
+            if str(folder.resolve()) in open_now:
+                continue
+            self.open_roll(folder)
+        if len(folders) > 1:
+            self.statusBar().showMessage(f"Imported {len(folders)} rolls", 5000)
 
     def open_roll(self, folder: Path, film: str = "", camera: str = "", lens: str = "",
                   marks: Optional[dict[str, list[dict[str, Any]]]] = None,
@@ -5785,6 +5895,7 @@ class MainWindow(QMainWindow):
         self.cfg.save()
         idx = self.tabs.addTab(page, folder.name)
         self.tabs.setCurrentIndex(idx)
+        self._refresh_central()
         self.mark_dirty()
         self.statusBar().showMessage(f"Opened {folder} — {len(page.roll.frames)} frames", 5000)
         return page
@@ -5800,6 +5911,7 @@ class MainWindow(QMainWindow):
         self.tabs.removeTab(index)
         if page:
             page.deleteLater()
+        self._refresh_central()
         self.mark_dirty()
 
     def _sync_before_closing(self, pages: list) -> bool:
