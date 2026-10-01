@@ -24,6 +24,9 @@
   <url type="homepage">https://github.com/shammer03/ProofMark</url>
   <url type="bugtracker">https://github.com/shammer03/ProofMark/issues</url>
   <releases>
+    <release version="1.3.0" date="2026-10-01">
+      <description><ul><li>Export sheets as JPEG, TIFF or PNG</li><li>Choose an export folder; PDF and images go there</li><li>Roll Info: title, shot date, lab, keywords and notes</li><li>Reorder, hide and add frames; drag and drop</li><li>Frame numbering styles; vertical frames can lie sideways</li><li>Colour labels synced to RapidRAW and XMP</li><li>Loupe histogram, clipping warnings and focus highlighting</li></ul></description>
+    </release>
     <release version="1.2.1" date="2026-10-01">
       <description><ul><li>Loupe and Mark modes with the same viewing controls</li><li>Wheel grows the loupe to 95%, then zooms the photo to 200%</li><li>Click zooms; drag draws (Mark) or moves the photo (Loupe)</li><li>Sync modes: auto, on close or manual</li><li>Line stabiliser and rebalanced brush sizes</li><li>Undo / redo and rotate buttons; full lens names</li><li>Fixes: font setting, quitting with a window open</li></ul></description>
     </release>

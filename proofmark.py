@@ -74,8 +74,8 @@ Image.MAX_IMAGE_PIXELS = None
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME = "ProofMark"
-APP_VERSION = "1.2.1"
-BUILD_NUMBER = 9
+APP_VERSION = "1.3.0"
+BUILD_NUMBER = 10
 BUILD_DATE = "2026-10-01"
 RELEASE_CHANNEL = "stable"
 APP_ID = "io.github.shammer03.ProofMark"  # reverse-DNS id used by Flatpak / AppStream; change to your own
@@ -85,6 +85,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Newest first. `release.py bump` inserts new entries at the marker.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
     # <changelog-insert>
+    ("1.3.0", "2026-10-01", [
+        'Export sheets as JPEG, TIFF or PNG',
+        'Choose an export folder; PDF and images go there',
+        'Roll Info: title, shot date, lab, keywords and notes',
+        'Reorder, hide and add frames; drag and drop',
+        'Frame numbering styles; vertical frames can lie sideways',
+        'Colour labels synced to RapidRAW and XMP',
+        'Loupe histogram, clipping warnings and focus highlighting']),
     ("1.2.1", "2026-10-01", [
         'Loupe and Mark modes with the same viewing controls',
         'Wheel grows the loupe to 95%, then zooms the photo to 200%',

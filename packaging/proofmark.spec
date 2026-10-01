@@ -1,6 +1,6 @@
 # Fedora RPM spec. Build:  rpmbuild -ba packaging/proofmark.spec   (or submit to COPR)
 Name:           proofmark
-Version:        1.2.1
+Version:        1.3.0
 Release:        1%{?dist}
 Summary:        Darkroom contact-sheet proofing with wax grease-pencil marks
 License:        GPL-3.0-or-later
