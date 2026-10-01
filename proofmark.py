@@ -3123,6 +3123,11 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._edit = {"idx": idx, "mark": mk, "mode": mode, "start": QPointF(pos), "moved": False,
                       "pts": [list(p) for p in mk.pts], "size": mk.size, "bounds": mark_bounds_px(mk, rect)}
 
+    def _on_view(self, pos: QPointF) -> bool:
+        """Mark mode: the cursor came onto the 60% view from its frame, so a click / the wheel is for it."""
+        box = self._hover_box()
+        return box is not None and self.tool != T_INSPECT and self._toward_view and box.contains(pos)
+
     def _hover_box(self) -> Optional[QRectF]:
         """The 60% hover view's box while it is showing, else None."""
         if (self.loupe_locked or self.compare or not self.loupe_enabled or self.hover_index < 0
@@ -3131,8 +3136,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         return self.loupe_geometry(self.hover_index, False)[0]
 
     def _update_cursor(self, pos: QPointF) -> None:
-        box = self._hover_box()
-        if box is not None and self._toward_view and box.contains(pos):  # the 60% view: click enlarges, wheel zooms
+        if self._on_view(pos):  # the 60% view: click enlarges, wheel zooms
             self.viewport().setCursor(Qt.PointingHandCursor)
             return
         cur = Qt.ArrowCursor
@@ -3302,6 +3306,18 @@ class ContactSheetCanvas(QAbstractScrollArea):
         bw, bh = vw * frac, vh * frac
         if locked:
             box = QRectF((vw - bw) / 2, (vh - bh) / 2, bw, bh)
+        elif self.tool != T_INSPECT:
+            # Mark mode: the 60% view sits in the half of the screen away from the frame, and stays
+            # when you move onto it (see mouseMoveEvent).
+            cell = self._cell_rect(idx)
+            gap = 16.0
+            if cell.center().x() < vw / 2:  # frame on the left: view on the right, clear of the frame
+                x = max(cell.right() + gap, vw - bw - 16)
+                w = vw - 16 - x
+            else:
+                x = 16.0
+                w = min(bw, cell.left() - gap - 16)
+            box = fit_rect(QRectF(x, (vh - bh) / 2, max(60.0, w), bh), self.frames[idx].aspect)
         else:
             box = self._hover_loupe_box(idx, bw, bh)
         base = fit_rect(box, self.frames[idx].aspect)
@@ -3637,8 +3653,9 @@ class ContactSheetCanvas(QAbstractScrollArea):
         width = max(1.5, img.width() * 0.011)
         for mk in self._marks_with_drag(i):
             draw_mark(p, mk, img, width)
-        if i == self.hover_index and not self.loupe_locked and not self.compare:
-            self._ghost(p, img, width)
+        if (not self.loupe_locked and not self.compare and img.contains(self.hover_pos)
+                and not self._on_view(self.hover_pos)):
+            self._ghost(p, img, width)  # preview of the next mark, on the frame under the cursor
         self._paint_selection(p, i, img)
         paint_frame_badges(p, slot, img, fr)
         self._paint_rebate(p, i, cell)
@@ -3760,8 +3777,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 self.selected = i
                 self.viewport().update()
             return
-        box = self._hover_box()
-        if box is not None and self._toward_view and box.contains(pos):  # click on the 60% view: enlarge to 95%
+        if self._on_view(pos):  # click on the 60% view: enlarge to 95%
             self.loupe_locked = True
             self.locked_index = self.selected = self.hover_index
             self._click_locked = True
@@ -3876,8 +3892,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
             box = self._hover_box()
             cell = self._cell_rect(self.hover_index) if self.hover_index >= 0 else QRectF()
             heading = box is not None and (box.contains(pos) or _dist_to_rect(pos, box) < _dist_to_rect(prev, box))
-            if (box is not None and self._toward_view and heading and not cell.contains(pos)
-                    and hull_polygon([cell, box]).containsPoint(pos, Qt.OddEvenFill)):
+            if (box is not None and self.tool != T_INSPECT and self._toward_view and heading
+                    and not cell.contains(pos) and hull_polygon([cell, box]).containsPoint(pos, Qt.OddEvenFill)):
                 # Travelling from the frame to its 60% view (or resting on it): the view stays put,
                 # like a menu that doesn't close while you move into its submenu. On the view a click
                 # enlarges it, the wheel zooms, and when zoomed in, moving pans.
@@ -3966,8 +3982,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
             if self.loupe_locked:
                 over_view = self.loupe_geometry(self.locked_index, True)[0].contains(pos)
             else:
-                box = self._hover_box()
-                over_view = box is not None and self._toward_view and box.contains(pos)
+                over_view = self._on_view(pos)
         if over_view or e.modifiers() & Qt.ControlModifier:
             idx = self.locked_index if self.loupe_locked else self.hover_index
             if idx >= 0 and not self.compare:
