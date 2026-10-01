@@ -1062,7 +1062,7 @@ def mark_polylines(mark: Mark, rect: QRectF) -> list[list[QPointF]]:
         if length < 1.0:
             return []
         ang = math.atan2(b.y() - a.y(), b.x() - a.x())
-        head = (min(length * 0.35, rect.width() * 0.07) + 2.0) * max(0.6, stroke_scale(mark.size) / 2)
+        head = (min(length * 0.35, rect.width() * 0.07) + 2.0) * 1.6 * max(0.05, mark.size) ** 0.35
         h1 = QPointF(b.x() - head * math.cos(ang - 0.5), b.y() - head * math.sin(ang - 0.5))
         h2 = QPointF(b.x() - head * math.cos(ang + 0.5), b.y() - head * math.sin(ang + 0.5))
         return [[a, b], [h1, b, h2]]
@@ -1246,7 +1246,7 @@ def smooth_line(npts: list[list[float]], rect: QRectF) -> list[list[float]]:
 
 
 def default_box_pts(rect: QRectF, n: list[float], scale: float) -> list[list[float]]:
-    half = 0.15 * min(rect.width(), rect.height()) * max(0.05, scale) ** 0.6
+    half = 0.15 * min(rect.width(), rect.height()) * max(0.05, scale) ** 0.3  # brush barely changes the default box
     hx = min(0.49, half / max(1e-6, rect.width()))
     hy = min(0.49, half / max(1e-6, rect.height()))
     cx, cy = min(1 - hx, max(hx, n[0])), min(1 - hy, max(hy, n[1]))
@@ -1297,25 +1297,31 @@ def resize_mark(mark: Mark, rect: QRectF, handle: str, pos: QPointF, orig: dict[
         mark.pts = out
 
 
-GLYPH_K, STROKE_K = 2.2, 3.0  # how big 100% is: symbols and pen thickness
+# How marks grow with the brush size (100% = factor below; the exponent sets how fast it grows).
+# Lines and arrows are thin strokes, so they get the weight; symbols and boxes stay modest so
+# they don't cover the photo.
+GLYPH_K, GLYPH_EXP = 1.4, 0.4                       # star / X / + / - size
+STROKE = {"line": (3.6, 0.7), "symbol": (1.8, 0.4)}  # pen thickness: lines & arrows, everything else
 
 
 def glyph_scale(size: float) -> float:
-    """Star / X / + / - size for a brush size: 25% still reads, 400% is big without filling the frame."""
-    return GLYPH_K * max(0.05, size) ** 0.6
+    """Star / X / + / - size for a brush size (25% ≈ 0.8, 100% = 1.4, 400% ≈ 2.4)."""
+    return GLYPH_K * max(0.05, size) ** GLYPH_EXP
 
 
 def size_for_glyph(scale: float) -> float:
-    return (max(1e-3, scale) / GLYPH_K) ** (1 / 0.6)
+    return (max(1e-3, scale) / GLYPH_K) ** (1 / GLYPH_EXP)
 
 
-def stroke_scale(size: float) -> float:
-    """Pen thickness for a brush size: 100% draws a solid line, 25% stays visible, 400% is bold (not huge)."""
-    return STROKE_K * max(0.05, size) ** 0.6
+def stroke_scale(size: float, kind: str = T_LINE) -> float:
+    """Pen thickness for a brush size; lines and arrows grow faster than symbols, crop boxes and rings."""
+    k, e = STROKE["line" if kind in (T_LINE, T_ARROW) else "symbol"]
+    return k * max(0.05, size) ** e
 
 
 def draw_mark(painter: QPainter, mark: Mark, rect: QRectF, width: float) -> None:
-    render_pen_strokes(painter, mark_polylines(mark, rect), width * stroke_scale(mark.size), QColor(mark.color),
+    render_pen_strokes(painter, mark_polylines(mark, rect), width * stroke_scale(mark.size, mark.kind),
+                       QColor(mark.color),
                        mark.seed, mark.style, rect.topLeft())
 
 
