@@ -42,8 +42,8 @@ try:
 except ImportError:  # RAW support degrades gracefully
     rawpy = None
 
-from PySide6.QtCore import QMarginsF, QProcess, QUrl
-from PySide6.QtGui import QDesktopServices, QPageLayout
+from PySide6.QtCore import QMarginsF, QProcess, QSizeF, QUrl
+from PySide6.QtGui import QDesktopServices, QPageLayout, QPageSize
 from PySide6.QtWidgets import QCheckBox, QColorDialog, QFontComboBox, QTextBrowser, QToolButton
 
 try:  # print support ships with PySide6 on Fedora; degrade gracefully if missing
@@ -160,9 +160,13 @@ def install_kind() -> str:
 DEV_INFO = {
     "name": "S. Hambrick",
     "role": "Photographer & developer",
+    "location": "Tennessee",
     "website": "https://github.com/shammer03/ProofMark",
-    "email": "",
-    "bio": "",
+    "email": "",  # GitHub is the only contact; leave blank
+    "bio": ("Career Army veteran and lifelong photographer based in Tennessee. I built ProofMark because "
+            "nothing on the computer felt like proofing a roll of film the traditional way: laying out "
+            "the contact sheet and marking stars, rejects and crops with a grease pencil. ProofMark "
+            "brings that workflow to the screen."),
 }
 CONFIG_DIR = Path.home() / ".config" / "proofmark"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -215,13 +219,16 @@ T_ADJUST = "adjust"
 BRUSH_COLORS = [("Red", "#FF3B30"), ("Toxic Green", "#39FF14"),
                 ("Silver", "#E6E6EA"), ("Yellow", "#FFE600")]
 DEFAULT_BRUSH_COLOR = BRUSH_COLORS[0][1]
+PEN_STYLES = [("wax", "Wax pencil"), ("china", "China marker"), ("marker", "Felt marker"), ("standard", "Standard")]
+PEN_NAMES = dict(PEN_STYLES)
+DEFAULT_PEN = "wax"
 POINT_TOOLS = {T_STAR, T_REJECT, T_PUSH, T_PULL}   # click places, drag outward sizes
 BOX_TOOLS = {T_CROP, T_RING}                      # drag a box; click places a default box
 DRAG_TOOLS = {T_LINE, T_ARROW, T_CROP, T_RING}
 
 TOOL_LIST = [
     (T_INSPECT, "Inspect", "V", "Inspect: hover for loupe, click to enlarge"),
-    (T_STAR, "★ Pick", "P", "Star pick  (* / P)"),
+    (T_STAR, "★ Star", "P", "Star  (* / P)"),
     (T_REJECT, "☒ Reject", "X", "Boxed reject  (X)"),
     (T_PUSH, "+ Push", "+", "Exposure push  (+)"),
     (T_PULL, "− Pull", "-", "Exposure pull  (-)"),
@@ -376,15 +383,18 @@ class Mark:
     seed: int
     size: float = 1.0
     color: str = DEFAULT_BRUSH_COLOR
+    style: str = DEFAULT_PEN
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind, "pts": [[round(x, 5), round(y, 5)] for x, y in self.pts], "seed": self.seed,
-                "size": round(self.size, 3), "color": self.color}
+                "size": round(self.size, 3), "color": self.color, "style": self.style}
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> "Mark":
+        style = str(d.get("style", DEFAULT_PEN))
         return Mark(str(d["kind"]), [[float(p[0]), float(p[1])] for p in d.get("pts", [])],
-                    int(d.get("seed", 1)), float(d.get("size", 1.0)), str(d.get("color", DEFAULT_BRUSH_COLOR)))
+                    int(d.get("seed", 1)), float(d.get("size", 1.0)), str(d.get("color", DEFAULT_BRUSH_COLOR)),
+                    style if style in PEN_NAMES else DEFAULT_PEN)
 
 
 class Frame:
@@ -780,53 +790,134 @@ def _resample(pts: list[QPointF], step: float) -> list[QPointF]:
     return out
 
 
-def render_heavy_grease_stroke(painter: QPainter, pts: list[QPointF], base_width: float,
-                               color: QColor, seed: int) -> None:
-    """
-    Multi-pass procedural china-marker stroke.
-    Deterministic per seed so a mark never shimmers between repaints.
-    Passes: broad translucent body -> jittered mid layers -> thin dry core,
-    with random dry skips (wax friction), width/opacity variation and crumbs.
-    """
-    if not pts:
-        return
-    if len(pts) == 1:
-        pts = [pts[0], QPointF(pts[0].x() + 0.1, pts[0].y())]
-    dense = _resample(pts, max(0.8, base_width * 0.32))
-    if len(dense) < 2:
-        return
-    painter.save()
-    painter.setRenderHint(QPainter.Antialiasing, True)
-    passes = ((1.00, 0.26, 0.00), (0.78, 0.32, 0.00), (0.52, 0.42, 0.10), (0.26, 0.60, 0.16))
-    for idx, (w_mul, a_mul, skip) in enumerate(passes):
-        rng = random.Random(seed * 131 + idx * 7919)
-        jit = base_width * 0.20
-        pen = QPen()
+# Per pen: (width multiplier, edge wobble, overall opacity, streak chance, streak width range, streak alpha range)
+PEN_LOOK: dict[str, tuple[float, float, float, float, tuple[float, float], tuple[float, float]]] = {
+    "wax": (1.00, 0.07, 0.93, 0.55, (0.05, 0.11), (0.30, 0.75)),     # grease pencil: waxy drag streaks
+    "china": (1.30, 0.10, 0.97, 0.38, (0.07, 0.16), (0.25, 0.60)),   # china marker: bolder, coarser grain
+    "marker": (1.10, 0.02, 0.82, 0.30, (0.04, 0.07), (0.06, 0.14)),  # felt tip: smooth, translucent ink
+    "standard": (0.75, 0.0, 1.00, 0.0, (0.0, 0.0), (0.0, 0.0)),      # clean line
+}
+_STROKE_CACHE: "OrderedDict[tuple, QImage]" = OrderedDict()
+
+
+def _wobbled(pts: list[QPointF], amp: float, wavelength: float, seed: int) -> list[QPointF]:
+    """Offset a dense polyline sideways by smooth low-frequency noise (a hand-held pen, not jitter)."""
+    if amp <= 0 or len(pts) < 2:
+        return pts
+    rng = random.Random(seed)
+    waves = [(rng.uniform(0, math.tau), rng.uniform(0.7, 1.3) * wavelength * k) for k in (1.0, 0.47, 0.23)]
+    out: list[QPointF] = []
+    s = 0.0
+    for i, p in enumerate(pts):
+        if i:
+            s += math.hypot(p.x() - pts[i - 1].x(), p.y() - pts[i - 1].y())
+        a, b = pts[max(0, i - 1)], pts[min(len(pts) - 1, i + 1)]
+        tx, ty = b.x() - a.x(), b.y() - a.y()
+        ln = math.hypot(tx, ty) or 1.0
+        off = amp * sum(math.sin(s / lam + ph) * w for (ph, lam), w in zip(waves, (0.6, 0.3, 0.1)))
+        out.append(QPointF(p.x() - ty / ln * off, p.y() + tx / ln * off))
+    return out
+
+
+def _paint_pen_layer(lp: QPainter, polys: list[list[QPointF]], width: float, color: QColor,
+                     style: str, seed: int) -> None:
+    """Draw one mark's strokes at full strength, then wipe paper-grain streaks out of them."""
+    w_mul, wobble, _opacity, streak_p, streak_w, streak_a = PEN_LOOK[style]
+    w = max(0.8, width * w_mul)
+    lp.setRenderHint(QPainter.Antialiasing, True)
+    dense_polys = []
+    for k, poly in enumerate(polys):
+        dense = _resample(poly, max(0.6, w * 0.25)) if len(poly) > 1 else poly
+        dense = _wobbled(dense, w * wobble, max(10.0, w * 9.0), seed + k * 31)
+        dense_polys.append(dense)
+        pen = QPen(QColor(color.red(), color.green(), color.blue()), w)
         pen.setCapStyle(Qt.RoundCap)
         pen.setJoinStyle(Qt.RoundJoin)
-        prev: Optional[QPointF] = None
-        for p in dense:
-            q = QPointF(p.x() + rng.gauss(0, jit * 0.5), p.y() + rng.gauss(0, jit * 0.5))
-            if prev is not None and rng.random() >= skip:
-                c = QColor(color)
-                c.setAlphaF(min(1.0, a_mul * (0.55 + 0.9 * rng.random())))
-                pen.setColor(c)
-                pen.setWidthF(max(0.6, base_width * w_mul * (0.72 + 0.56 * rng.random())))
-                painter.setPen(pen)
-                painter.drawLine(prev, q)
-            prev = q
-    # Crumb dispersion
-    rng = random.Random(seed * 977 + 5)
-    painter.setPen(Qt.NoPen)
-    for p in dense:
-        if rng.random() < 0.32:
-            ang = rng.random() * math.tau
-            dist = abs(rng.gauss(0, base_width * 0.85)) + base_width * 0.42
-            r = rng.uniform(0.25, 1.0) * base_width * 0.17
-            c = QColor(color)
-            c.setAlphaF(rng.uniform(0.25, 0.75))
-            painter.setBrush(c)
-            painter.drawEllipse(QPointF(p.x() + math.cos(ang) * dist, p.y() + math.sin(ang) * dist), r, r)
+        lp.setPen(pen)
+        lp.setBrush(Qt.NoBrush)
+        if len(dense) == 1:
+            lp.drawPoint(dense[0])
+        else:
+            path = QPainterPath(dense[0])
+            for q in dense[1:]:
+                path.lineTo(q)
+            lp.drawPath(path)
+    if streak_p <= 0:
+        return
+    # Grain: short streaks running along the stroke, where the wax skipped over the paper's tooth.
+    lp.setCompositionMode(QPainter.CompositionMode_DestinationOut)
+    rng = random.Random(seed * 7919 + 13)
+    streak_pen = QPen()
+    streak_pen.setCapStyle(Qt.RoundCap)
+    for dense in dense_polys:
+        for i in range(0, len(dense) - 1, 2):  # points are 1/4 pen width apart: a chance every half width
+            if rng.random() >= streak_p:
+                continue
+            a, b = dense[i], dense[min(len(dense) - 1, i + 1)]
+            tx, ty = b.x() - a.x(), b.y() - a.y()
+            ln = math.hypot(tx, ty) or 1.0
+            tx, ty = tx / ln, ty / ln
+            u = rng.uniform(-0.5, 0.5) * w * (1.08 if rng.random() < 0.35 else 0.85)  # edges break up more
+            half = w * rng.uniform(0.4, 1.4)
+            cx, cy = a.x() - ty * u, a.y() + tx * u
+            c = QColor(0, 0, 0)
+            c.setAlphaF(rng.uniform(*streak_a))
+            streak_pen.setColor(c)
+            streak_pen.setWidthF(max(0.4, w * rng.uniform(*streak_w)))
+            lp.setPen(streak_pen)
+            lp.drawLine(QPointF(cx - tx * half, cy - ty * half), QPointF(cx + tx * half, cy + ty * half))
+    lp.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+
+def render_pen_strokes(painter: QPainter, polys: list[list[QPointF]], width: float, color: QColor,
+                       seed: int, style: str = DEFAULT_PEN, origin: Optional[QPointF] = None) -> None:
+    """
+    Draw a mark's strokes with the chosen pen. The strokes are drawn into their own layer so
+    overlaps inside one mark don't darken (real wax lays down one even coat), and the result is
+    cached because painting happens on every mouse move.
+    `origin` (the image rect's corner) keeps the cache valid while the sheet scrolls.
+    """
+    polys = [p for p in polys if p]
+    if not polys:
+        return
+    style = style if style in PEN_LOOK else DEFAULT_PEN
+    opacity = PEN_LOOK[style][2]
+    if style == "standard":
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        _paint_pen_layer(painter, polys, width, color, style, seed)
+        painter.restore()
+        return
+    org = origin if origin is not None else QPointF(0, 0)
+    rel = [[QPointF(q.x() - org.x(), q.y() - org.y()) for q in poly] for poly in polys]
+    pad = width * 2.2 + 2
+    xs = [q.x() for poly in rel for q in poly]
+    ys = [q.y() for poly in rel for q in poly]
+    box = QRectF(QPointF(min(xs) - pad, min(ys) - pad), QPointF(max(xs) + pad, max(ys) + pad))
+    dev = painter.device()
+    dpr = dev.devicePixelRatioF() if dev is not None else 1.0
+    area = box.width() * box.height() * dpr * dpr
+    key = (style, color.rgba(), round(width, 2), seed, round(dpr, 2),
+           tuple((round(q.x(), 1), round(q.y(), 1)) for poly in rel for q in poly))
+    img = _STROKE_CACHE.get(key)
+    if img is None:
+        img = QImage(max(1, math.ceil(box.width() * dpr)), max(1, math.ceil(box.height() * dpr)),
+                     QImage.Format_ARGB32_Premultiplied)
+        img.setDevicePixelRatio(dpr)
+        img.fill(Qt.transparent)
+        lp = QPainter(img)
+        lp.translate(-box.x(), -box.y())
+        _paint_pen_layer(lp, rel, width, color, style, seed)
+        lp.end()
+        if area < 3.0e6:  # don't hoard huge layers from a zoomed loupe
+            _STROKE_CACHE[key] = img
+            while len(_STROKE_CACHE) > 400:
+                _STROKE_CACHE.popitem(last=False)
+    else:
+        _STROKE_CACHE.move_to_end(key)
+    painter.save()
+    painter.setOpacity(painter.opacity() * opacity)
+    painter.drawImage(QPointF(org.x() + box.x(), org.y() + box.y()), img)
     painter.restore()
 
 
@@ -982,6 +1073,19 @@ def mark_hit(mark: Mark, rect: QRectF, pos: QPointF, tol: float = 9.0) -> bool:
     return False
 
 
+def fit_point_mark(mark: Mark, rect: QRectF, anchor: QPointF, pos: QPointF, min_drag: float = 4.0) -> bool:
+    """Size and place a point mark in the square spanned from `anchor` (a fixed corner) towards `pos`."""
+    dx, dy = pos.x() - anchor.x(), pos.y() - anchor.y()
+    side = max(abs(dx), abs(dy))
+    if side <= min_drag:
+        return False
+    unit = max(1.0, point_unit(mark, rect))
+    mark.size = max(0.25, min(8.0, side / 2 / unit))
+    r = unit * mark.size
+    mark.pts = [_norm(rect, anchor.x() + math.copysign(r, dx or 1.0), anchor.y() + math.copysign(r, dy or 1.0))]
+    return True
+
+
 def default_box_pts(rect: QRectF, n: list[float], scale: float) -> list[list[float]]:
     half = 0.15 * min(rect.width(), rect.height()) * scale
     hx = min(0.49, half / max(1e-6, rect.width()))
@@ -1003,10 +1107,11 @@ def resize_mark(mark: Mark, rect: QRectF, handle: str, pos: QPointF, orig: dict[
         mark.pts = pts0
         mark.pts[0 if handle == "a" else 1] = _norm(rect, pos.x(), pos.y())
         return
-    if is_point_mark(mark):  # corner handle: uniform scale about the centre
-        c = _px(rect, pts0[0])
-        r = math.hypot(pos.x() - c.x(), pos.y() - c.y()) / math.sqrt(2.0)
-        mark.size = max(0.25, min(8.0, r / max(1.0, point_unit(mark, rect))))
+    if is_point_mark(mark):  # corner handle: the opposite corner stays put
+        b0: QRectF = orig["bounds"]
+        anchor = {"nw": b0.bottomRight(), "ne": b0.bottomLeft(), "se": b0.topLeft(), "sw": b0.topRight()}[handle]
+        mark.pts = pts0
+        fit_point_mark(mark, rect, anchor, pos, min_drag=1.0)
         return
     b: QRectF = orig["bounds"]
     left, top, right, bottom = b.left(), b.top(), b.right(), b.bottom()
@@ -1034,8 +1139,8 @@ def resize_mark(mark: Mark, rect: QRectF, handle: str, pos: QPointF, orig: dict[
 
 
 def draw_mark(painter: QPainter, mark: Mark, rect: QRectF, width: float) -> None:
-    for i, poly in enumerate(mark_polylines(mark, rect)):
-        render_heavy_grease_stroke(painter, poly, width * mark.size, QColor(mark.color), mark.seed + i * 17)
+    render_pen_strokes(painter, mark_polylines(mark, rect), width * mark.size, QColor(mark.color),
+                       mark.seed, mark.style, rect.topLeft())
 
 
 def draw_barcode(painter: QPainter, rect: QRectF, code: str, color: QColor) -> None:
@@ -1693,13 +1798,14 @@ class AboutDialog(QDialog):
         name = DEV_INFO["name"] or cfg.profile.get("artist", "") or "Your name here"
         parts = [f'<h2 style="color:{ACCENT_HEX};">{escape(name)}</h2>']
         if DEV_INFO["role"]:
-            parts.append(f"<p><b>{escape(DEV_INFO['role'])}</b></p>")
+            where = f" · {escape(DEV_INFO['location'])}" if DEV_INFO.get("location") else ""
+            parts.append(f"<p><b>{escape(DEV_INFO['role'])}</b>{where}</p>")
         parts.append(f"<p>{escape(DEV_INFO['bio'])}</p>" if DEV_INFO["bio"] else
                      "<p>ProofMark was designed and built for real darkroom workflows — scanning, proofing and "
                      "sorting film the analog way, with the speed of software.</p>")
         if DEV_INFO["website"]:
             url = escape(DEV_INFO["website"])
-            parts.append(f'<p>Website: <a style="color:{ACCENT_HEX};" href="{url}">{url}</a></p>')
+            parts.append(f'<p>Contact and issues: <a style="color:{ACCENT_HEX};" href="{url}">{url}</a></p>')
         if DEV_INFO["email"]:
             mail = escape(DEV_INFO["email"])
             parts.append(f'<p>Contact: <a style="color:{ACCENT_HEX};" href="mailto:{mail}">{mail}</a></p>')
@@ -1767,7 +1873,7 @@ class SettingsDialog(QDialog):
         self.cols = self._spin(2, 14, int(s("default_columns")), "")
         self.hover_loupe = QCheckBox("Show the hover loupe by default")
         self.hover_loupe.setChecked(bool(s("hover_loupe")))
-        fc.addRow("Default columns", self.cols)
+        fc.addRow("Columns in Full screen view", self.cols)
         fc.addRow(self.hover_loupe)
         tabs.addTab(cs, "Contact Sheet")
 
@@ -2257,11 +2363,85 @@ def paint_frame_clean(p: QPainter, cell: QRectF, rebate_h: float, idx: int, meta
     p.restore()
 
 
-def render_contact_sheet(printer: Any, roll: Roll, columns: int, meta: dict[str, Any],
+VIEW_MODES = [("full", "Full screen"), ("4x6", "4×6 print"), ("5x7", "5×7 print"), ("8x10", "8×10 contact sheet")]
+PAPER_INCHES = {"4x6": (4.0, 6.0), "5x7": (5.0, 7.0), "8x10": (8.0, 10.0)}  # short side, long side
+SHEET_MARGIN_IN = 0.25
+CELL_RATIO = THUMB_H / THUMB_W + 0.085  # cell height / cell width, rebate strip included
+
+
+@dataclass
+class SheetLayout:
+    """Where the frames go inside a page's printable area (pixels, relative to that area)."""
+    cols: int
+    cell_w: float
+    cell_h: float
+    rebate_h: float
+    x0: float
+    y0: float
+    head_h: float
+    foot_h: float
+    per_page: int
+    pages: int
+
+
+def sheet_layout(w: float, h: float, n: int, header: bool, cols: Optional[int] = None) -> SheetLayout:
+    """
+    Lay out `n` frames in a w x h printable area. With `cols` the column count is fixed and the roll
+    runs over as many pages as it needs; without it, every frame goes on one page as large as possible
+    (a contact sheet), so the screen preview and the printout are always the same.
+    """
+    head_h = h * 0.045 if header else 0.0
+    foot_h = h * 0.03
+    avail = max(1.0, h - head_h - foot_h)
+    if cols is None:
+        best_w, best_c = 0.0, 1
+        for c in range(1, max(1, n) + 1):
+            cw = min(w / c, avail / (math.ceil(max(1, n) / c) * CELL_RATIO))
+            if cw > best_w + 1e-9:
+                best_w, best_c = cw, c
+        cols, cell_w = best_c, best_w
+    else:
+        cols = max(1, cols)
+        cell_w = min(w / cols, avail / CELL_RATIO)
+    cell_h = cell_w * CELL_RATIO
+    per_page = max(1, int(avail / cell_h + 1e-6)) * cols
+    return SheetLayout(cols, cell_w, cell_h, cell_w * 0.085, (w - cell_w * cols) / 2, head_h, head_h, foot_h,
+                       per_page, max(1, math.ceil(n / per_page)))
+
+
+def paper_inches(view: str, n: int, header: bool) -> tuple[float, float]:
+    """(width, height) of the paper for a print view, turned whichever way shows the frames larger."""
+    short, long_ = PAPER_INCHES[view]
+    m = 2 * SHEET_MARGIN_IN
+    portrait = sheet_layout(short - m, long_ - m, n, header).cell_w
+    landscape = sheet_layout(long_ - m, short - m, n, header).cell_w
+    return (long_, short) if landscape > portrait else (short, long_)
+
+
+def paint_sheet_text(p: QPainter, rect: QRectF, lay: SheetLayout, roll: Roll, page: int, color: QColor) -> None:
+    """Header (roll, film, camera, lens, date) and footer (version, frame count, page) of a sheet."""
+    import datetime
+    font = QFont("DejaVu Sans")
+    font.setPixelSize(max(6, int(rect.height() * 0.014)))
+    p.setFont(font)
+    p.setPen(color)
+    title = f"{roll.folder.name}   ·   {roll.film}   ·   {roll.camera}   ·   {roll.lens}"
+    top = QRectF(rect.x(), rect.y(), rect.width(), lay.head_h)
+    p.drawText(QRectF(top.x(), top.y(), top.width() * 0.75, top.height()), Qt.AlignVCenter | Qt.AlignLeft,
+               QFontMetrics(font, p.device()).elidedText(title, Qt.ElideRight, int(top.width() * 0.75)))
+    p.drawText(top, Qt.AlignVCenter | Qt.AlignRight, datetime.date.today().isoformat())
+    foot = QRectF(rect.x(), rect.bottom() - lay.foot_h, rect.width(), lay.foot_h)
+    p.drawText(foot, Qt.AlignVCenter | Qt.AlignLeft, f"ProofMark v{APP_VERSION}  ·  {len(roll.frames)} frames")
+    p.drawText(foot, Qt.AlignVCenter | Qt.AlignRight, f"Page {page + 1} of {lay.pages}")
+
+
+def render_contact_sheet(printer: Any, roll: Roll, columns: Optional[int], meta: dict[str, Any],
                          pixmap_for: Callable[[Frame], Optional[QPixmap]],
                          ink_saver: bool = False, header: bool = True) -> int:
-    """Paginate the roll onto `printer` (paper or PDF) using the on-screen column count. Returns page count."""
-    import datetime
+    """
+    Print the roll on `printer` (paper or PDF). `columns` = the Full-screen column count, paginated;
+    None = one contact sheet with every frame, as on the screen's print views. Returns the page count.
+    """
     p = QPainter()
     if not p.begin(printer):
         return 0
@@ -2269,49 +2449,25 @@ def render_contact_sheet(printer: Any, roll: Roll, columns: int, meta: dict[str,
     # The painter's origin is already the top-left of the printable area (inside the margins).
     paint = printer.pageLayout().paintRectPixels(printer.resolution())
     rect = QRectF(0, 0, paint.width(), paint.height())
-    cols = max(1, columns)
     n = len(roll.frames)
-    head_h = rect.height() * 0.045 if header else 0.0
-    foot_h = rect.height() * 0.03
-    avail_h = rect.height() - head_h - foot_h
-    ratio = THUMB_H / THUMB_W + 0.085  # cell height / cell width, same proportions as the screen
-    cell_w = int(rect.width() // cols)
-    if cell_w * ratio > avail_h:
-        cell_w = int(avail_h / ratio)
-    cell_h = int(cell_w * ratio)
-    rebate_h = cell_w * 0.085
-    per_page = max(1, int(avail_h // cell_h)) * cols
-    pages = max(1, math.ceil(n / per_page))
-    x0 = rect.x() + (rect.width() - cell_w * cols) / 2
-    font = QFont("DejaVu Sans")
-    font.setPixelSize(max(6, int(rect.height() * 0.014)))
-    p.setFont(font)
-    title = f"{roll.folder.name}   ·   {roll.film}   ·   {roll.camera}   ·   {roll.lens}"
-    for page in range(pages):
+    lay = sheet_layout(rect.width(), rect.height(), n, header, columns)
+    for page in range(lay.pages):
         if page:
             printer.newPage()
-        p.setPen(QColor("#000000"))
         if header:
-            p.drawText(QRectF(rect.x(), rect.y(), rect.width() * 0.75, head_h), Qt.AlignVCenter | Qt.AlignLeft,
-                       QFontMetrics(font, p.device()).elidedText(title, Qt.ElideRight, int(rect.width() * 0.75)))
-            p.drawText(QRectF(rect.x(), rect.y(), rect.width(), head_h), Qt.AlignVCenter | Qt.AlignRight,
-                       datetime.date.today().isoformat())
-            p.drawText(QRectF(rect.x(), rect.bottom() - foot_h, rect.width(), foot_h), Qt.AlignVCenter | Qt.AlignLeft,
-                       f"ProofMark v{APP_VERSION}  ·  {n} frames")
-            p.drawText(QRectF(rect.x(), rect.bottom() - foot_h, rect.width(), foot_h), Qt.AlignVCenter | Qt.AlignRight,
-                       f"Page {page + 1} of {pages}")
-        first = page * per_page
-        rows_here = math.ceil(min(per_page, n - first) / cols) if n else 0
-        for k in range(rows_here * cols):
+            paint_sheet_text(p, rect, lay, roll, page, QColor("#000000"))
+        first = page * lay.per_page
+        rows_here = math.ceil(min(lay.per_page, n - first) / lay.cols) if n else 0
+        for k in range(rows_here * lay.cols):
             i = first + k
-            r, c = divmod(k, cols)
-            cell = QRectF(x0 + c * cell_w, rect.y() + head_h + r * cell_h, cell_w, cell_h)
+            r, c = divmod(k, lay.cols)
+            cell = QRectF(lay.x0 + c * lay.cell_w, lay.y0 + r * lay.cell_h, lay.cell_w, lay.cell_h)
             if i >= n:
                 p.fillRect(cell, QColor("#FFFFFF") if ink_saver else C_FILM)
             else:
-                paint_frame_clean(p, cell, rebate_h, i, meta, pixmap_for(roll.frames[i]), ink_saver)
+                paint_frame_clean(p, cell, lay.rebate_h, i, meta, pixmap_for(roll.frames[i]), ink_saver)
     p.end()
-    return pages
+    return lay.pages
 
 
 class ContactSheetCanvas(QAbstractScrollArea):
@@ -2339,14 +2495,22 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.roll = roll
         self.frames = roll.frames
         self.tool = T_INSPECT
-        self.columns = 6
+        self.columns = 6          # Full-screen view; print views compute their own
+        self.full_columns = 6
+        self.view = "full"
+        self.print_header = True
         self.loupe_enabled = True
         self.brush_size = 1.0
         self.brush_color = DEFAULT_BRUSH_COLOR
-        self.cell_w = 100
-        self.cell_h = 100
-        self.x0 = 0
+        self.brush_style = DEFAULT_PEN
+        self.cell_w = 100.0
+        self.cell_h = 100.0
+        self.x0 = 0.0
+        self.y0 = 0.0
         self.rebate_h = 20.0
+        self.page_rect: Optional[QRectF] = None   # paper outline on print views
+        self.page_inner: Optional[QRectF] = None  # its printable area (inside the margins)
+        self.sheet: Optional[SheetLayout] = None
 
         self.hover_index = -1
         self.hover_pos = QPointF(-1, -1)
@@ -2390,7 +2554,13 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.viewport().update()
 
     def set_columns(self, cols: int) -> None:
-        self.columns = max(1, cols)
+        self.full_columns = max(1, cols)
+        self._update_scrollbar()
+        self.viewport().update()
+
+    def set_view(self, view: str) -> None:
+        self.view = view if view in PAPER_INCHES else "full"
+        self.verticalScrollBar().setValue(0)
         self._update_scrollbar()
         self.viewport().update()
 
@@ -2410,9 +2580,10 @@ class ContactSheetCanvas(QAbstractScrollArea):
             return
         n = norm_in_rect(rect, self.hover_pos)
         if self.tool in POINT_TOOLS:
-            mk = Mark(self.tool, [n], 1, self.brush_size, self.brush_color)
+            mk = Mark(self.tool, [n], 1, self.brush_size, self.brush_color, self.brush_style)
         elif self.tool in BOX_TOOLS:
-            mk = Mark(self.tool, default_box_pts(rect, n, self.brush_size), 1, self.brush_size, self.brush_color)
+            mk = Mark(self.tool, default_box_pts(rect, n, self.brush_size), 1, self.brush_size, self.brush_color,
+                      self.brush_style)
         else:
             return
         p.save()
@@ -2492,21 +2663,39 @@ class ContactSheetCanvas(QAbstractScrollArea):
         return int(self.viewport().height() * 0.6) if self.compare else 0
 
     def _layout(self) -> None:
-        vw = self.viewport().width()
-        cols = max(1, self.columns)
-        self.cell_w = max(40, vw // cols)
-        self.x0 = max(0, (vw - self.cell_w * cols) // 2)  # centred: no left-side bunching
+        vw, vh = self.viewport().width(), self.viewport().height()
+        gt = self.grid_top
+        if self.view in PAPER_INCHES:
+            # The page exactly as it prints: same paper, margins, header and layout as render_contact_sheet.
+            pw, ph = paper_inches(self.view, len(self.frames), self.print_header)
+            area = QRectF(16, gt + 12, vw - 32, vh - gt - 24)
+            scale = max(1e-3, min(area.width() / pw, area.height() / ph))
+            page = QRectF(area.center().x() - pw * scale / 2, area.center().y() - ph * scale / 2, pw * scale, ph * scale)
+            m = SHEET_MARGIN_IN * scale
+            inner = page.adjusted(m, m, -m, -m)
+            lay = sheet_layout(inner.width(), inner.height(), len(self.frames), self.print_header)
+            self.page_rect, self.page_inner, self.sheet = page, inner, lay
+            self.columns = lay.cols
+            self.cell_w, self.cell_h, self.rebate_h = lay.cell_w, lay.cell_h, lay.rebate_h
+            self.x0, self.y0 = inner.x() + lay.x0, inner.y() + lay.y0
+            return
+        self.page_rect = self.page_inner = self.sheet = None
+        cols = self.columns = max(1, self.full_columns)
+        self.cell_w = float(max(40, vw // cols))
+        self.x0 = float(max(0, (vw - self.cell_w * cols) // 2))  # centred: no left-side bunching
+        self.y0 = float(gt)
         self.rebate_h = max(16.0, self.cell_w * 0.085)
-        self.cell_h = int(round(self.cell_w * THUMB_H / THUMB_W + self.rebate_h))  # rows flush
+        self.cell_h = float(round(self.cell_w * THUMB_H / THUMB_W + self.rebate_h))  # rows flush
 
     def _update_scrollbar(self) -> None:
         self._layout()
         rows = math.ceil(len(self.frames) / max(1, self.columns)) if self.frames else 0
         avail = max(1, self.viewport().height() - self.grid_top)
         sb = self.verticalScrollBar()
-        sb.setRange(0, max(0, rows * self.cell_h - avail))
+        content = 0 if self.page_rect is not None else rows * self.cell_h  # a print view always fits
+        sb.setRange(0, max(0, int(content - avail)))
         sb.setPageStep(avail)
-        sb.setSingleStep(max(16, self.cell_h // 3))
+        sb.setSingleStep(max(16, int(self.cell_h // 3)))
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -2515,7 +2704,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
     def _cell_rect(self, i: int) -> QRectF:
         row, col = divmod(i, max(1, self.columns))
         return QRectF(self.x0 + col * self.cell_w,
-                      self.grid_top + row * self.cell_h - self.verticalScrollBar().value(),
+                      self.y0 + row * self.cell_h - self.verticalScrollBar().value(),
                       self.cell_w, self.cell_h)
 
     def _slot_rect(self, cell: QRectF) -> QRectF:
@@ -2526,10 +2715,9 @@ class ContactSheetCanvas(QAbstractScrollArea):
 
     def cell_at(self, pos: QPointF) -> int:
         self._layout()
-        gt = self.grid_top
-        if pos.y() < gt or not self.frames:
+        if pos.y() < self.grid_top or pos.y() < self.y0 or pos.x() < self.x0 or not self.frames:
             return -1
-        yy = pos.y() - gt + self.verticalScrollBar().value()
+        yy = pos.y() - self.y0 + self.verticalScrollBar().value()
         row = int(yy // self.cell_h)
         col = int((pos.x() - self.x0) // self.cell_w)
         if yy < 0 or col < 0 or col >= self.columns:
@@ -2544,8 +2732,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         if locked:
             box = QRectF((vw - bw) / 2, (vh - bh) / 2, bw, bh)
         else:
-            on_left = self.hover_pos.x() < vw / 2
-            box = QRectF(vw - bw - 16 if on_left else 16, (vh - bh) / 2, bw, bh)
+            box = self._hover_loupe_box(idx, bw, bh)
         base = fit_rect(box, self.frames[idx].aspect)
         w, h = base.width() * self.zoom, base.height() * self.zoom
         fx, fy = (self.focus.x(), self.focus.y()) if self.zoom > 1.0 else (0.5, 0.5)
@@ -2554,6 +2741,46 @@ class ContactSheetCanvas(QAbstractScrollArea):
         cx = self._clamp_axis(cx, w, box.left(), box.right())
         cy = self._clamp_axis(cy, h, box.top(), box.bottom())
         return box, QRectF(cx - w / 2, cy - h / 2, w, h)
+
+    def _hover_loupe_box(self, idx: int, max_w: float, max_h: float) -> QRectF:
+        """
+        Hover loupe right next to the hovered frame, never covering it: try all four sides, keep the
+        one that shows the photo largest, and when two are close prefer the one nearer the screen centre.
+        """
+        vw, vh = self.viewport().width(), self.viewport().height()
+        cell = self._cell_rect(idx)
+        aspect = self.frames[idx].aspect
+        gap, edge = 12.0, 8.0
+        mid = QPointF(vw / 2, vh / 2)
+        regions = {  # free space on each side of the frame
+            "right": QRectF(cell.right() + gap, edge, vw - edge - cell.right() - gap, vh - 2 * edge),
+            "left": QRectF(edge, edge, cell.left() - gap - edge, vh - 2 * edge),
+            "below": QRectF(edge, cell.bottom() + gap, vw - 2 * edge, vh - edge - cell.bottom() - gap),
+            "above": QRectF(edge, edge, vw - 2 * edge, cell.top() - gap - edge),
+        }
+        options: list[tuple[float, float, QRectF]] = []
+        for side, region in regions.items():
+            if region.width() < 40 or region.height() < 40:
+                continue
+            img = fit_rect(QRectF(0, 0, min(region.width(), max_w), min(region.height(), max_h)), aspect)
+            w, h = img.width(), img.height()
+            if side in ("right", "left"):
+                x = region.left() if side == "right" else region.right() - w
+                y = min(max(cell.center().y() - h / 2, region.top()), region.bottom() - h)
+            else:
+                y = region.top() if side == "below" else region.bottom() - h
+                x = min(max(cell.center().x() - w / 2, region.left()), region.right() - w)
+            box = QRectF(x, y, w, h)
+            options.append((w * h, math.hypot(box.center().x() - mid.x(), box.center().y() - mid.y()), box))
+        target = fit_rect(QRectF(0, 0, max_w, max_h), aspect)
+        if options:
+            biggest = max(o[0] for o in options)
+            if biggest >= 0.2 * target.width() * target.height():
+                close = [o for o in options if o[0] >= 0.8 * biggest]
+                return min(close, key=lambda o: o[1])[2]
+        # No room beside the frame (very large cells): use the half of the screen away from the cursor.
+        on_left = self.hover_pos.x() < vw / 2
+        return QRectF(vw - max_w - 16 if on_left else 16, (vh - max_h) / 2, max_w, max_h)
 
     @staticmethod
     def _clamp_axis(c: float, size: float, lo: float, hi: float) -> float:
@@ -2640,13 +2867,20 @@ class ContactSheetCanvas(QAbstractScrollArea):
         p.save()
         p.setClipRect(QRect(0, gt, vw, vh - gt))
         scroll = self.verticalScrollBar().value()
-        first = max(0, scroll // self.cell_h)
-        last = (scroll + vh - gt) // self.cell_h + 1
+        rows = math.ceil(len(self.frames) / self.columns)
+        if self.page_rect is not None and self.sheet is not None:
+            p.fillRect(self.page_rect, QColor("#F4F4F2"))  # the paper
+            if self.print_header and self.page_inner is not None:
+                paint_sheet_text(p, self.page_inner, self.sheet, self.roll, 0, QColor("#222222"))
+        first = max(0, int((scroll - (self.y0 - gt)) // self.cell_h))
+        last = int((scroll + vh - self.y0) // self.cell_h) + 1
+        if self.page_rect is not None:
+            last = min(last, rows - 1)  # nothing below the last row of a printed sheet
         for row in range(first, last + 1):
             for col in range(self.columns):
                 i = row * self.columns + col
                 if i >= len(self.frames):
-                    cell = QRectF(self.x0 + col * self.cell_w, gt + row * self.cell_h - scroll,
+                    cell = QRectF(self.x0 + col * self.cell_w, self.y0 + row * self.cell_h - scroll,
                                   self.cell_w, self.cell_h)
                     p.fillRect(cell, C_FILM)
                     continue
@@ -2838,7 +3072,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
             n = norm_in_rect(rect, pos)
             pts = [n] if (is_point or self.tool == T_LINE) else [n, list(n)]
             self._drag = {"idx": idx, "point": is_point, "start": QPointF(pos),
-                          "mark": Mark(self.tool, pts, random.getrandbits(31), self.brush_size, self.brush_color)}
+                          "mark": Mark(self.tool, pts, random.getrandbits(31), self.brush_size, self.brush_color,
+                                       self.brush_style)}
         else:  # inspect
             self._last_click_added = None
             if not self.loupe_locked and self.loupe_enabled:
@@ -2877,13 +3112,10 @@ class ContactSheetCanvas(QAbstractScrollArea):
             n = norm_in_rect(rect, pos)
             mark: Mark = self._drag["mark"]
             if self._drag["point"]:
-                cx = rect.x() + mark.pts[0][0] * rect.width()
-                cy = rect.y() + mark.pts[0][1] * rect.height()
-                dist = math.hypot(pos.x() - cx, pos.y() - cy)
-                if dist > 4.0:
-                    unit = 0.075 * min(rect.width(), rect.height()) * (1.15 if mark.kind == T_STAR else 1.0)
-                    mark.size = max(0.25, min(8.0, dist / max(1.0, unit)))
-                else:
+                # Like the ring: the press point is one corner, the cursor the opposite one.
+                start = self._drag["start"]
+                if not fit_point_mark(mark, rect, start, pos):
+                    mark.pts = [norm_in_rect(rect, start)]
                     mark.size = self.brush_size
             elif mark.kind == T_LINE:
                 last = mark.pts[-1]
@@ -3046,7 +3278,7 @@ class RollPage(QWidget):
     openEquipment = Signal(str)
 
     def __init__(self, cfg: ConfigStore, folder: Path, camera: str, film: str, lens: str,
-                 marks: Optional[dict[str, list[dict[str, Any]]]], columns: int, tool: str,
+                 marks: Optional[dict[str, list[dict[str, Any]]]], columns: int, view: str, tool: str,
                  loupe: bool, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.cfg = cfg
@@ -3056,7 +3288,9 @@ class RollPage(QWidget):
             self.roll.apply_marks(marks)
         self.canvas = ContactSheetCanvas(self.roll)
         self.canvas._film_lookup = cfg.film_meta  # type: ignore[method-assign,assignment]
-        self.canvas.columns = columns
+        self.canvas.full_columns = columns
+        self.canvas.view = view if view in PAPER_INCHES else "full"
+        self.canvas.print_header = bool(cfg.setting("print_header"))
         self.canvas.tool = tool
         self.canvas.loupe_enabled = loupe
 
@@ -3229,6 +3463,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Import a roll to begin  (File ▸ Import Roll…, Ctrl+O)")
         self.brush_size = 1.0
         self.brush_color = DEFAULT_BRUSH_COLOR
+        self.brush_style = DEFAULT_PEN
+        self.view = "full"
         self._build_actions()
 
         self.autosave = QTimer(self)
@@ -3236,7 +3472,6 @@ class MainWindow(QMainWindow):
         self.autosave.timeout.connect(self._autosave_tick)
         self.autosave.start()
         self.statusBar().addPermanentWidget(QLabel(f"v{version_string()}  "))
-        self.col_spin.setValue(int(self.cfg.setting("default_columns")))
         self.loupe_action.setChecked(bool(self.cfg.setting("hover_loupe")))
         self.apply_settings()
 
@@ -3302,12 +3537,14 @@ class MainWindow(QMainWindow):
         self.print_action.triggered.connect(lambda _c=False: self.print_sheet())
         tb.addAction(self.print_action)
         tb.addSeparator()
-        tb.addWidget(QLabel(" Columns "))
-        self.col_spin = QSpinBox()
-        self.col_spin.setRange(2, 14)
-        self.col_spin.setValue(6)
-        self.col_spin.valueChanged.connect(self._columns_changed)
-        tb.addWidget(self.col_spin)
+        tb.addWidget(QLabel(" View "))
+        self.view_combo = QComboBox()
+        for key, label in VIEW_MODES:
+            self.view_combo.addItem(label, key)
+        self.view_combo.setToolTip("Full screen fills the window (columns are set in Settings).\n"
+                                   "Print sizes show the contact sheet exactly as it prints on that paper.")
+        self.view_combo.currentIndexChanged.connect(lambda _i: self.set_view(self.view_combo.currentData()))
+        tb.addWidget(self.view_combo)
 
         # Second toolbar row: brush size slider + wax colours
         self.addToolBarBreak()
@@ -3340,6 +3577,14 @@ class MainWindow(QMainWindow):
             bb.addAction(act)
             self.color_actions[chex] = act
         self.color_actions[self.brush_color].setChecked(True)
+        bb.addSeparator()
+        bb.addWidget(QLabel("Pen"))
+        self.pen_combo = QComboBox()
+        for key, label in PEN_STYLES:
+            self.pen_combo.addItem(label, key)
+        self.pen_combo.setToolTip("How new marks look: wax pencil, china marker, felt marker or a clean line")
+        self.pen_combo.currentIndexChanged.connect(lambda _i: self._apply_brush(style=self.pen_combo.currentData()))
+        bb.addWidget(self.pen_combo)
 
         # Compact-menu mode: every menu collapses into one ☰ button at the start of the toolbar
         self.burger = QMenu(self)
@@ -3364,11 +3609,17 @@ class MainWindow(QMainWindow):
         p.end()
         return pm
 
-    def _apply_brush(self, size: Optional[float] = None, color: Optional[str] = None) -> None:
+    def _apply_brush(self, size: Optional[float] = None, color: Optional[str] = None,
+                     style: Optional[str] = None) -> None:
         if size is not None:
             self.brush_size = max(0.25, min(4.0, size))
         if color is not None and color in self.color_actions:
             self.brush_color = color
+        if style is not None and style in PEN_NAMES:
+            self.brush_style = style
+        self.pen_combo.blockSignals(True)
+        self.pen_combo.setCurrentIndex(max(0, self.pen_combo.findData(self.brush_style)))
+        self.pen_combo.blockSignals(False)
         self.size_slider.blockSignals(True)
         self.size_slider.setValue(int(round(self.brush_size * 100)))
         self.size_slider.blockSignals(False)
@@ -3377,6 +3628,7 @@ class MainWindow(QMainWindow):
         for page in self.pages():
             page.canvas.brush_size = self.brush_size
             page.canvas.brush_color = self.brush_color
+            page.canvas.brush_style = self.brush_style
             page.canvas.viewport().update()
         self.mark_dirty()
 
@@ -3456,9 +3708,13 @@ class MainWindow(QMainWindow):
         for page in self.pages():
             page.canvas.set_loupe_enabled(on)
 
-    def _columns_changed(self, n: int) -> None:
+    def set_view(self, view: str) -> None:
+        self.view = view if view in PAPER_INCHES else "full"
+        self.view_combo.blockSignals(True)
+        self.view_combo.setCurrentIndex(max(0, self.view_combo.findData(self.view)))
+        self.view_combo.blockSignals(False)
         for page in self.pages():
-            page.canvas.set_columns(n)
+            page.canvas.set_view(self.view)
         self.mark_dirty()
 
     def _tab_changed(self, _i: int) -> None:
@@ -3487,7 +3743,8 @@ class MainWindow(QMainWindow):
         prof = self.cfg.profile
         try:
             page = RollPage(self.cfg, folder, camera or prof.get("camera", ""), film or prof.get("film", ""),
-                            lens or prof.get("lens", ""), marks, self.col_spin.value(), self.tool,
+                            lens or prof.get("lens", ""), marks, int(self.cfg.setting("default_columns")), self.view,
+                            self.tool,
                             self.loupe_action.isChecked())
         except OSError as exc:
             QMessageBox.warning(self, "Cannot open roll", f"{folder}\n\n{exc}")
@@ -3495,6 +3752,7 @@ class MainWindow(QMainWindow):
         self._wire_page(page)
         page.canvas.brush_size = self.brush_size
         page.canvas.brush_color = self.brush_color
+        page.canvas.brush_style = self.brush_style
         idx = self.tabs.addTab(page, folder.name)
         self.tabs.setCurrentIndex(idx)
         self.mark_dirty()
@@ -3539,17 +3797,19 @@ class MainWindow(QMainWindow):
     def show_keys(self) -> None:
         QMessageBox.information(self, "Keyboard Reference", (
             "TOOLS\n"
-            "P or *  Star pick      X  Boxed reject      + / -  Exposure push / pull\n"
+            "P or *  Star           X  Boxed reject      + / -  Exposure push / pull\n"
             "#  Crop box            R  Squircle ring     L  Line      A  Arrow\n"
             "E  Adjust (select / move / resize marks)     V or Esc  Inspect\n\n"
             "PLACING MARKS\n"
-            "Click places at the brush size.  Click-drag: stars, X, + and - grow outward;\n"
-            "crop box and ring drag out a box.  Box, arrow and line stay selected so you can drag\n"
+            "Click places at the brush size.  Click-drag draws every mark from the corner you press\n"
+            "towards the cursor, like a box.  Box, arrow and line stay selected so you can drag\n"
             "their handles.  Adjust tool: click a mark, drag to move, drag handles to resize.\n"
             "Delete removes the selected mark, arrow keys nudge it (Shift = bigger steps), Esc deselects.\n\n"
-            "BRUSH\n[ / ]  Smaller / larger     1-4  Red / Toxic green / Silver / Yellow\n\n"
+            "BRUSH\n[ / ]  Smaller / larger     1-4  Red / Toxic green / Silver / Yellow\n"
+            "Pen menu: wax pencil, china marker, felt marker or standard line\n\n"
             "VIEWING\n"
-            "Hover  50% loupe     Click (Inspect) / Right-click / Space  Enlarge to 85%\n"
+            "Hover  loupe beside the frame     Click (Inspect) / Right-click / Space  Enlarge to 85%\n"
+            "View menu  Full screen, or the sheet as it prints on 4×6, 5×7 or 8×10 paper\n"
             "Ctrl+Wheel  Zoom 0.7×–4.5×     Right-drag  Pan     0  Reset zoom\n"
             "C  2-up compare (hover for [B]); C or Esc exits\n\n"
             "UNDO\nDouble-click  Pop topmost mark     Ctrl+Z  Pop most recent mark\n\n"
@@ -3558,8 +3818,8 @@ class MainWindow(QMainWindow):
     # ── session persistence ────────────────────────────────────────────────
     def save_session(self) -> None:
         state = {"version": 1, "current_tab": self.tabs.currentIndex(), "tool": self.tool,
-                 "columns": self.col_spin.value(), "brush_size": self.brush_size,
-                 "brush_color": self.brush_color, "rolls": [p.to_session() for p in self.pages()]}
+                 "view": self.view, "brush_size": self.brush_size,
+                 "brush_color": self.brush_color, "brush_style": self.brush_style, "rolls": [p.to_session() for p in self.pages()]}
         try:
             atomic_write_json(SESSION_FILE, state)
             self._session_dirty = False
@@ -3579,8 +3839,9 @@ class MainWindow(QMainWindow):
         if rolls and QMessageBox.question(
                 self, "Restore session", "Reopen previous contact sheet session?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes:
-            self.col_spin.setValue(int(state.get("columns", 6)))
-            self._apply_brush(float(state.get("brush_size", 1.0)), state.get("brush_color", DEFAULT_BRUSH_COLOR))
+            self.set_view(str(state.get("view", "full")))
+            self._apply_brush(float(state.get("brush_size", 1.0)), state.get("brush_color", DEFAULT_BRUSH_COLOR),
+                              str(state.get("brush_style", DEFAULT_PEN)))
             self.set_tool(state.get("tool", T_INSPECT) if state.get("tool") in self.tool_actions else T_INSPECT)
             for r in rolls:
                 folder = Path(r.get("folder", ""))
@@ -3641,7 +3902,8 @@ class MainWindow(QMainWindow):
         self.autosave.setInterval(max(2, int(c.setting("autosave_secs"))) * 1000)
         self.sync_worker.rapidraw_exif = bool(c.setting("rapidraw_exif"))
         for page in self.pages():
-            page.canvas.viewport().update()
+            page.canvas.print_header = bool(c.setting("print_header"))
+            page.canvas.set_columns(int(c.setting("default_columns")))
 
     def _apply_layout_prefs(self) -> None:
         area = Qt.BottomToolBarArea if self.cfg.setting("toolbar_area") == "bottom" else Qt.TopToolBarArea
@@ -3665,7 +3927,15 @@ class MainWindow(QMainWindow):
         if pdf_path:
             printer.setOutputFormat(QPrinter.PdfFormat)
             printer.setOutputFileName(pdf_path)
-        printer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout.Millimeter)
+        view = page.canvas.view
+        if view in PAPER_INCHES:  # same paper, orientation and margins as the screen preview
+            pw, ph = paper_inches(view, len(page.roll.frames), bool(self.cfg.setting("print_header")))
+            printer.setPageSize(QPageSize(QSizeF(min(pw, ph), max(pw, ph)), QPageSize.Inch,
+                                          f"{PAPER_INCHES[view][0]:g}x{PAPER_INCHES[view][1]:g} in"))
+            printer.setPageOrientation(QPageLayout.Landscape if pw > ph else QPageLayout.Portrait)
+            printer.setPageMargins(QMarginsF(*[SHEET_MARGIN_IN * 25.4] * 4), QPageLayout.Millimeter)
+        else:
+            printer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout.Millimeter)
         printer.setDocName(f"{APP_NAME} – {page.roll.folder.name}")
         return printer
 
@@ -3673,7 +3943,8 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             pages = render_contact_sheet(
-                printer, page.roll, page.canvas.columns, self.cfg.film_meta(page.roll.film),
+                printer, page.roll, None if page.canvas.view in PAPER_INCHES else page.canvas.columns,
+                self.cfg.film_meta(page.roll.film),
                 page.canvas.preview_pixmap, bool(self.cfg.setting("print_ink_saver")),
                 bool(self.cfg.setting("print_header")))
         finally:
@@ -3800,7 +4071,7 @@ def build_icon_pixmap(size: int = 512) -> QPixmap:
     cx, cy, r = s * 0.5, s * 0.37, s * 0.19
     star = [QPointF(cx + r * math.cos(-math.pi / 2 + 4 * math.pi / 5 * i),
                     cy + r * math.sin(-math.pi / 2 + 4 * math.pi / 5 * i)) for i in range(6)]
-    render_heavy_grease_stroke(p, star, s * 0.03, C_GREASE, 42)
+    render_pen_strokes(p, [star], s * 0.03, C_GREASE, 42, "wax")
     p.end()
     return pm
 
