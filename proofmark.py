@@ -72,8 +72,8 @@ Image.MAX_IMAGE_PIXELS = None
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME = "ProofMark"
-APP_VERSION = "1.1.1"
-BUILD_NUMBER = 6
+APP_VERSION = "1.1.2"
+BUILD_NUMBER = 7
 BUILD_DATE = "2026-09-30"
 RELEASE_CHANNEL = "stable"
 APP_ID = "io.github.shammer03.ProofMark"  # reverse-DNS id used by Flatpak / AppStream; change to your own
@@ -83,6 +83,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Newest first. `release.py bump` inserts new entries at the marker.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
     # <changelog-insert>
+    ("1.1.2", "2026-09-30", [
+        'Non-destructive like RapidRAW: your original image files are never modified',
+        "Artist, copyright and film / camera / lens go into RapidRAW's .rrdata sidecar and are applied when RapidRAW exports",
+        "ProofMark's marks moved to their own .pmdata sidecar, so RapidRAW edits are no longer overwritten",
+        'An existing .xmp from another app is no longer replaced']),
     ("1.1.1", "2026-09-30", [
         'Print and PDF export: contact sheet is centred with correct margins',
         "Images that can't be opened are labelled instead of showing loading… forever",

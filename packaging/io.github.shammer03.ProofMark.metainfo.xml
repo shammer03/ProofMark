@@ -25,6 +25,9 @@
   <url type="bugtracker">https://github.com/shammer03/ProofMark/issues</url>
   <!-- TODO: add at least one <screenshot> (required by Flathub) -->
   <releases>
+    <release version="1.1.2" date="2026-09-30">
+      <description><ul><li>Non-destructive like RapidRAW: your original image files are never modified</li><li>Artist, copyright and film / camera / lens go into RapidRAW's .rrdata sidecar and are applied when RapidRAW exports</li><li>ProofMark's marks moved to their own .pmdata sidecar, so RapidRAW edits are no longer overwritten</li><li>An existing .xmp from another app is no longer replaced</li></ul></description>
+    </release>
     <release version="1.1.1" date="2026-09-30">
       <description><ul><li>Print and PDF export: contact sheet is centred with correct margins</li><li>Images that can't be opened are labelled instead of showing loading… forever</li><li>Closing during loading or syncing no longer risks a crash or lost sidecars</li><li>Wayland: app ID registers correctly; Ctrl+C in a terminal closes cleanly</li><li>Number fields show their up / down arrows on the dark theme</li></ul></description>
     </release>
