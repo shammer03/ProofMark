@@ -62,7 +62,8 @@ from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QComboBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMainWindow, QMenu,
-                               QMessageBox, QPushButton, QSizePolicy, QSlider, QSpinBox, QTabWidget,
+                               QMessageBox, QPushButton, QRadioButton, QSizePolicy, QSlider, QSpinBox,
+                               QSystemTrayIcon, QTabWidget,
                                QVBoxLayout, QWidget)
 
 Image.MAX_IMAGE_PIXELS = None
@@ -92,31 +93,26 @@ CHANGELOG: list[tuple[str, str, list[str]]] = [
         'Sync Data button; ratings and tags sync to RapidRAW and XMP',
         'Larger loupe that opens beside the frame']),
     ("1.1.2", "2026-09-30", [
-        'Non-destructive like RapidRAW: your original image files are never modified',
-        "Artist, copyright and film / camera / lens go into RapidRAW's .rrdata sidecar and are applied when RapidRAW exports",
-        "ProofMark's marks moved to their own .pmdata sidecar, so RapidRAW edits are no longer overwritten",
-        'An existing .xmp from another app is no longer replaced']),
+        'Non-destructive sidecars: original files are never modified',
+        'Metadata sync to RapidRAW (.rrdata)',
+        'Existing .xmp files from other apps are preserved']),
     ("1.1.1", "2026-09-30", [
-        'Print and PDF export: contact sheet is centred with correct margins',
-        "Images that can't be opened are labelled instead of showing loading… forever",
-        'Closing during loading or syncing no longer risks a crash or lost sidecars',
-        'Wayland: app ID registers correctly; Ctrl+C in a terminal closes cleanly',
-        'Number fields show their up / down arrows on the dark theme']),
+        'Print and PDF margin fix',
+        'Clearer handling of unreadable images',
+        'Stability and Wayland fixes']),
     ("1.1.0", "2026-09-30", [
-        "Crop box and ring are real boxes: drag one out, or click for a default, then drag its handles to resize",
-        "New Adjust tool (E): select any mark, move it, resize it with handles, nudge with the arrow keys, Delete removes",
-        "Version and build-number tracking, Version History, and an in-app update check",
-        "One-click Print Contact Sheet and Export PDF: clean, unmarked, same layout as the screen",
-        "Settings: font, interface scale, accent colour, menu bar and toolbar placement, printing, sync and updates",
-        "Packaging files for RPM (COPR / Fedora) and Flatpak (Flathub), plus a release helper script"]),
+        'Resizable crop and ring marks',
+        'Adjust tool for moving and resizing marks',
+        'Print and PDF export',
+        'Settings, version history and update check']),
     ("1.0.3", "2026-09", [
-        "About and Developer pages; click-drag to size marks; window opens maximised and fits the screen"]),
+        'About pages and click-drag mark sizing']),
     ("1.0.2", "2026-09", [
-        "Brush size slider and four wax colours; favorites menus for films, cameras and lenses"]),
+        'Brush size and wax colours; equipment favorites']),
     ("1.0.1", "2026-09", [
-        "Personal equipment inventory with mounts; Fedora desktop launcher"]),
+        'Equipment inventory and desktop launcher']),
     ("1.0.0", "2026-09", [
-        "First release: contact sheet, grease-pencil tools, loupe, compare mode, session recovery, sidecar sync"]),
+        'First release']),
 ]
 
 
@@ -238,7 +234,7 @@ BOX_TOOLS = {T_CROP, T_RING}                      # drag a box; click places a d
 DRAG_TOOLS = {T_LINE, T_ARROW, T_CROP, T_RING}
 
 TOOL_LIST = [
-    (T_INSPECT, "Inspect", "V", "Inspect: hover for loupe, click to enlarge"),
+    (T_INSPECT, "◎ Loupe", "V", "Loupe mode  (V / Esc): hover to magnify, click to enlarge. Marking tools are off"),
     (T_STAR, "★ Star", "P", "Star  (* / P)"),
     (T_REJECT, "☒ Reject", "X", "Boxed reject  (X)"),
     (T_PUSH, "+ Push", "+", "Exposure push  (+)"),
@@ -715,11 +711,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "font_family": "", "font_size": 10, "ui_scale": 100, "accent": "#FFA726",
     "menu_mode": "top", "toolbar_area": "top", "rebate_scale": 100,
     "default_columns": 6, "hover_loupe": True,
-    "autosave_secs": 4, "sync_enabled": True, "rapidraw_exif": True, "xmp_sync": True, "sync_on_exit": True,
-    "star_ratings": dict(DEFAULT_STAR_RATINGS), "print_marks": False,
+    "autosave_secs": 4, "sync_mode": "auto", "sync_delay": 2, "rapidraw_exif": True, "xmp_sync": True,
+    "star_ratings": dict(DEFAULT_STAR_RATINGS), "print_marks": False, "tray_icon": True,
     "print_direct": False, "print_ink_saver": False, "print_header": True,
     "auto_update_check": True, "update_repo": "",
 }
+
+
+SYNC_MODES = [("auto", "Auto-sync"), ("close", "Sync on close"), ("manual", "Manual only")]
+SYNC_MODE_NAMES = dict(SYNC_MODES)
 
 
 class ConfigStore:
@@ -823,7 +823,12 @@ class ConfigStore:
         self.renames.append((kind, old, new))
 
     def setting(self, key: str) -> Any:
-        return self.data.setdefault("settings", {}).get(key, DEFAULT_SETTINGS[key])
+        settings = self.data.setdefault("settings", {})
+        if key == "sync_mode" and "sync_mode" not in settings and "sync_enabled" in settings:
+            # 1.2.0 had two switches; map them onto the three sync modes
+            settings["sync_mode"] = ("auto" if settings.get("sync_enabled", True)
+                                     else "close" if settings.get("sync_on_exit", True) else "manual")
+        return settings.get(key, DEFAULT_SETTINGS[key])
 
     def set_setting(self, key: str, value: Any) -> None:
         self.data.setdefault("settings", {})[key] = value
@@ -1285,6 +1290,8 @@ QToolBar { spacing: 4px; padding: 4px; border-bottom: 1px solid #222; }
 QToolButton { background: #1b1b1b; color: #FFFFFF; border: 1px solid #2a2a2a; padding: 5px 9px; border-radius: 3px; }
 QToolButton:hover { border-color: #FFA726; }
 QToolButton:checked { background: #FFA726; color: #000000; font-weight: bold; }
+QToolButton:disabled { background: #121212; color: #4a4a4a; border-color: #1e1e1e; }
+QToolButton:checked:disabled { background: #2a2216; color: #7a6440; font-weight: normal; }
 QTabWidget::pane { border: none; }
 QTabBar::tab { background: #141414; color: #bbbbbb; padding: 7px 16px; border: 1px solid #222; border-bottom: none; }
 QTabBar::tab:selected { color: #000000; background: #FFA726; font-weight: bold; }
@@ -1306,6 +1313,11 @@ QToolBar QLabel { background: transparent; color: #dddddd; padding: 0 4px; }
 QSlider::groove:horizontal { height: 5px; background: #333; border-radius: 2px; }
 QSlider::sub-page:horizontal { background: #FFA726; border-radius: 2px; }
 QSlider::handle:horizontal { background: #FFA726; width: 18px; height: 18px; margin: -7px 0; border-radius: 9px; }
+QRadioButton::indicator { width: 12px; height: 12px; border-radius: 8px; border: 2px solid #777; background: #141414; }
+QRadioButton::indicator:checked { background: #FFA726; border: 2px solid #FFA726; }
+QCheckBox::indicator { width: 12px; height: 12px; border-radius: 2px; border: 2px solid #777; background: #141414; }
+QCheckBox::indicator:checked { background: #FFA726; border: 2px solid #FFA726; image: url("@ARROW_DIR@/check.png"); }
+QRadioButton::indicator:hover, QCheckBox::indicator:hover { border-color: #FFA726; }
 QSpinBox { padding-right: 18px; }
 QSpinBox::up-button, QSpinBox::down-button { subcontrol-origin: border; width: 16px; background: #222222; border-left: 1px solid #333; }
 QSpinBox::up-button { subcontrol-position: top right; }
@@ -1323,6 +1335,16 @@ def _spin_arrow_dir() -> str:
     out = CACHE_DIR / "ui"
     try:
         out.mkdir(parents=True, exist_ok=True)
+        check = out / "check.png"
+        if not check.exists():  # dark tick drawn on the accent-filled checkbox
+            img = QImage(12, 12, QImage.Format_ARGB32)
+            img.fill(Qt.transparent)
+            p = QPainter(img)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setPen(QPen(QColor("#000000"), 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.drawPolyline([QPointF(2.5, 6.5), QPointF(5.0, 9.0), QPointF(9.5, 3.5)])
+            p.end()
+            img.save(str(check), "PNG")
         for name, tip_y, base_y in (("up", 2.0, 8.0), ("down", 8.0, 2.0)):
             target = out / f"{name}.png"
             if target.exists():
@@ -1957,9 +1979,14 @@ class SettingsDialog(QDialog):
         self.sys_font.setChecked(not s("font_family"))
         self.font_combo = QFontComboBox()
         self.font_combo.setCurrentFont(QFont(str(s("font_family")) or QApplication.font().family()))
-        self.font_combo.setEnabled(not self.sys_font.isChecked())
-        self.sys_font.toggled.connect(lambda on: self.font_combo.setEnabled(not on))
+        # Picking a font switches off "system default" by itself (the list is never greyed out).
+        self.font_combo.currentFontChanged.connect(lambda _f: self.sys_font.setChecked(False))
         self.font_size = self._spin(8, 22, int(s("font_size")), " pt")
+        self.font_preview = QLabel("Roll 36  ·  Kodak Tri-X 400  ·  ★★★★  0123456789")
+        self.font_preview.setStyleSheet("color:#CCCCCC; padding: 6px; border: 1px solid #2a2a2a;")
+        for sig in (self.font_combo.currentFontChanged, self.sys_font.toggled, self.font_size.valueChanged):
+            sig.connect(lambda *_a: self._preview_font())
+        self._preview_font()
         self.scale = self._spin(75, 200, self._start_scale, " %")
         self.scale.setToolTip("Scales the whole interface. Takes effect the next time ProofMark starts.")
         self.accent_btn = QPushButton()
@@ -1977,11 +2004,18 @@ class SettingsDialog(QDialog):
         fa.addRow(self.sys_font)
         fa.addRow("Font", self.font_combo)
         fa.addRow("Font size", self.font_size)
+        fa.addRow("Preview", self.font_preview)
         fa.addRow("Interface scale", self.scale)
         fa.addRow("Accent colour", self.accent_btn)
         fa.addRow("Menu bar", self.menu_mode)
         fa.addRow("Toolbars", self.tb_area)
         fa.addRow("Film-edge text size", self.rebate)
+        self.tray_icon = QCheckBox("Show a ProofMark icon in the system tray (Show / Sync Data / Quit)")
+        self.tray_icon.setChecked(bool(s("tray_icon")))
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon.setEnabled(False)
+            self.tray_icon.setToolTip("Your desktop has no system tray. On GNOME, enable the AppIndicator extension.")
+        fa.addRow(self.tray_icon)
         reset = QPushButton("Reset appearance to defaults")
         reset.clicked.connect(self._reset_appearance)
         fa.addRow(reset)
@@ -1991,7 +2025,7 @@ class SettingsDialog(QDialog):
         cs = QWidget()
         fc = QFormLayout(cs)
         self.cols = self._spin(2, 14, int(s("default_columns")), "")
-        self.hover_loupe = QCheckBox("Show the hover loupe by default")
+        self.hover_loupe = QCheckBox("Loupe mode magnifies on hover (off: click to enlarge only)")
         self.hover_loupe.setChecked(bool(s("hover_loupe")))
         fc.addRow("Columns in Full screen view", self.cols)
         fc.addRow(self.hover_loupe)
@@ -2001,16 +2035,24 @@ class SettingsDialog(QDialog):
         fs = QWidget()
         ff = QFormLayout(fs)
         self.autosave = self._spin(2, 60, int(s("autosave_secs")), " s")
-        self.sync_enabled = QCheckBox("Sync automatically while you mark (otherwise use the ⟳ Sync button)")
-        self.sync_enabled.setChecked(bool(s("sync_enabled")))
+        self.sync_radios: dict[str, QRadioButton] = {}
+        mode_box = QVBoxLayout()
+        for key, label, hint in (("auto", "Auto-sync", "while you mark, after a short pause"),
+                                 ("close", "Sync on close", "when a roll or ProofMark is closed"),
+                                 ("manual", "Manual only", "only when you press Sync Data")):
+            rb = QRadioButton(f"{label}  —  {hint}")
+            rb.setChecked(s("sync_mode") == key)
+            self.sync_radios[key] = rb
+            mode_box.addWidget(rb)
+        self.sync_delay = self._spin(1, 120, int(s("sync_delay")), " s after the last change")
+        self.sync_radios["auto"].toggled.connect(self.sync_delay.setEnabled)
+        self.sync_delay.setEnabled(s("sync_mode") == "auto")
         self.rapidraw_exif = QCheckBox("RapidRAW (.rrdata): Star rating, mark tags (user:star, user:rejected…), and\n"
                                        "artist / copyright / film · camera · lens, applied when RapidRAW exports")
         self.rapidraw_exif.setChecked(bool(s("rapidraw_exif")))
         self.xmp_sync = QCheckBox("Other apps' .xmp (Lightroom, darktable, digiKam, Capture One): rating,\n"
                                   "with Reject as -1 (their \"rejected\")")
         self.xmp_sync.setChecked(bool(s("xmp_sync")))
-        self.sync_on_exit = QCheckBox("Sync every frame when ProofMark closes")
-        self.sync_on_exit.setChecked(bool(s("sync_on_exit")))
         ratings = s("star_ratings") or {}
         star_row = QHBoxLayout()
         self.star_spins: dict[str, QSpinBox] = {}
@@ -2027,10 +2069,10 @@ class SettingsDialog(QDialog):
         note = QLabel("Ratings, tags and fields you change in those apps are never overwritten.\n"
                       "Your original image files are never modified.")
         note.setStyleSheet("color:#999;")
-        ff.addRow("Session autosave every", self.autosave)
-        ff.addRow(self.sync_enabled)
-        ff.addRow(self.sync_on_exit)
+        ff.addRow("Sync", mode_box)
+        ff.addRow("Auto-sync delay", self.sync_delay)
         ff.addRow(sync_now)
+        ff.addRow("Session autosave every", self.autosave)
         ff.addRow(self.rapidraw_exif)
         ff.addRow(self.xmp_sync)
         ff.addRow("Star colour → rating", star_row)
@@ -2093,6 +2135,11 @@ class SettingsDialog(QDialog):
             self._accent = c.name().upper()
             self._paint_accent()
 
+    def _preview_font(self) -> None:
+        family = QApplication.font().family() if self.sys_font.isChecked() else self.font_combo.currentFont().family()
+        self.font_preview.setStyleSheet(f'color:#CCCCCC; padding: 6px; border: 1px solid #2a2a2a; '
+                                        f'font-family: "{family}"; font-size: {self.font_size.value()}pt;')
+
     def _sync_now(self) -> None:
         win = self.parent()
         if win is not None and hasattr(win, "sync_all"):
@@ -2118,9 +2165,11 @@ class SettingsDialog(QDialog):
             "font_size": self.font_size.value(), "ui_scale": self.scale.value(), "accent": self._accent,
             "menu_mode": self.menu_mode.currentData(), "toolbar_area": self.tb_area.currentData(),
             "rebate_scale": self.rebate.value(), "default_columns": self.cols.value(),
+            "tray_icon": self.tray_icon.isChecked(),
             "hover_loupe": self.hover_loupe.isChecked(), "autosave_secs": self.autosave.value(),
-            "sync_enabled": self.sync_enabled.isChecked(), "rapidraw_exif": self.rapidraw_exif.isChecked(),
-            "xmp_sync": self.xmp_sync.isChecked(), "sync_on_exit": self.sync_on_exit.isChecked(),
+            "sync_mode": next(k for k, rb in self.sync_radios.items() if rb.isChecked()),
+            "sync_delay": self.sync_delay.value(),
+            "rapidraw_exif": self.rapidraw_exif.isChecked(), "xmp_sync": self.xmp_sync.isChecked(),
             "star_ratings": {h: sp.value() for h, sp in self.star_spins.items()},
             "print_marks": self.print_marks.isChecked(),
             "print_direct": self.print_direct.isChecked(), "print_ink_saver": self.ink_saver.isChecked(),
@@ -3992,15 +4041,25 @@ class RollPage(QWidget):
         self.roll.camera = self.camera_combo.currentData() or ""
         self.roll.lens = self.lens_combo.currentData() or ""
         self._sync_dirty.update(range(len(self.roll.frames)))
-        self._sync_timer.start()
+        self._schedule_sync()
         self.dirty.emit()
         self.canvas.viewport().update()
         self.canvas.setFocus()
 
     def _on_marks_changed(self, idx: int) -> None:
         self._sync_dirty.add(idx)
-        self._sync_timer.start()
+        self._schedule_sync()
         self.dirty.emit()
+
+    def _schedule_sync(self) -> None:
+        """Auto-sync: send the changed frames once you pause; other modes just remember them."""
+        if self.cfg.setting("sync_mode") == "auto":
+            self._sync_timer.setInterval(max(1, int(self.cfg.setting("sync_delay"))) * 1000)
+            self._sync_timer.start()
+
+    @property
+    def pending(self) -> int:
+        return len(self._sync_dirty)
 
     def build_job(self, idx: int) -> SyncJob:
         fr = self.roll.frames[idx]
@@ -4010,9 +4069,8 @@ class RollPage(QWidget):
                        int(self.cfg.film_meta(self.roll.film).get("iso", 400)), self.roll.film, fr.extras())
 
     def flush_sync(self, everything: bool = False) -> None:
-        if not everything and not self.cfg.setting("sync_enabled"):
-            self._sync_dirty.clear()
-            return
+        """Sync the changed frames now (or every frame)."""
+        self._sync_timer.stop()
         idxs = range(len(self.roll.frames)) if everything else sorted(self._sync_dirty)
         jobs = [self.build_job(i) for i in idxs]
         self._sync_dirty.clear()
@@ -4037,6 +4095,33 @@ class RollPage(QWidget):
     def shutdown(self) -> None:
         self.loader.stop()
         self.loader.wait()  # stops after the current file; a QThread destroyed while running aborts the app
+
+
+KEYS_TEXT = (
+    "TOOLS\n"
+    "P or *  Star           X  Boxed reject      + / -  Exposure push / pull\n"
+    "#  Crop box            R  Squircle ring     L  Line      A  Arrow\n"
+    "E  Adjust (select / move / resize marks)\n"
+    "MODES  V or Esc  Loupe mode (look only, tools off)     Any tool key or ✎ Mark  Mark mode\n\n"
+    "PLACING MARKS\n"
+    "Click places at the brush size.  Click-drag draws every mark from the corner you press\n"
+    "towards the cursor, like a box.  Box, arrow and line stay selected so you can drag\n"
+    "their handles.  Adjust tool: click a mark, drag to move, drag handles to resize.\n"
+    "Delete removes the selected mark, arrow keys nudge it (Shift = bigger steps), Esc deselects.\n\n"
+    "BRUSH\n[ / ]  Smaller / larger     Alt+1-4  Red / Toxic green / Silver / Yellow\n"
+    "Pen menu: wax pencil, china marker, felt marker or standard line\n\n"
+    "CULLING  (acts on the frame under the mouse, or the highlighted one after arrow keys)\n"
+    "Arrow keys / Home / End  Move between frames     1-5  Rate     0  Clear rating\n"
+    "Shift+X  Reject / un-reject     N  Frame note     Ctrl+] / Ctrl+[  Rotate     Space  Enlarge\n"
+    "Star colours rate too: green 5, red 5, yellow 4, silver 3 (Settings ▸ Files & Sync)\n\n"
+    "VIEWING\n"
+    "Hover  loupe beside the frame     Click (Inspect) / Right-click / Space  Enlarge to 95%\n"
+    "View  Full screen, or the sheet as it prints on 4×6, 5×7 or 8×10     Show  filter frames\n"
+    "Ctrl+Wheel  Zoom 0.7×–4.5×     Right-drag  Pan     Ctrl+0  Reset zoom\n"
+    "C  2-up compare (hover for [B]); C or Esc exits\n\n"
+    "UNDO\nCtrl+Z  Undo     Ctrl+Shift+Z  Redo     Double-click  Remove the frame's top mark\n\n"
+    "FILE\nCtrl+O Import   Ctrl+P Print   Ctrl+Shift+E PDF   Ctrl+Shift+S Export selects   Ctrl+S Sync Data\n"
+    "Ctrl+, Settings   F11 Full screen")
 
 
 class MainWindow(QMainWindow):
@@ -4071,6 +4156,7 @@ class MainWindow(QMainWindow):
         self.brush_color = DEFAULT_BRUSH_COLOR
         self.brush_style = DEFAULT_PEN
         self.view = "full"
+        self._windows: dict[str, QDialog] = {}  # open non-blocking dialogs by kind
         self._build_actions()
 
         self.autosave = QTimer(self)
@@ -4078,7 +4164,18 @@ class MainWindow(QMainWindow):
         self.autosave.timeout.connect(self._autosave_tick)
         self.autosave.start()
         self.statusBar().addPermanentWidget(QLabel(f"v{version_string()}  "))
-        self.loupe_action.setChecked(bool(self.cfg.setting("hover_loupe")))
+        self.tray: Optional[QSystemTrayIcon] = None
+        if QSystemTrayIcon.isSystemTrayAvailable():  # GNOME needs the AppIndicator extension for this
+            self.tray = QSystemTrayIcon(QIcon(build_icon_pixmap(64)), self)
+            self.tray.setToolTip(APP_NAME)
+            menu = QMenu(self)
+            menu.addAction("Show ProofMark").triggered.connect(self._show_from_tray)
+            menu.addAction("⟳ Sync Data").triggered.connect(self.sync_all)
+            menu.addSeparator()
+            menu.addAction("Quit ProofMark").triggered.connect(self.quit_app)
+            self.tray.setContextMenu(menu)
+            self.tray.activated.connect(
+                lambda reason: self._show_from_tray() if reason == QSystemTrayIcon.Trigger else None)
         self.apply_settings()
 
     # ── UI construction ────────────────────────────────────────────────────
@@ -4099,7 +4196,7 @@ class MainWindow(QMainWindow):
         m_file.addSeparator()
         self._act(m_file, "Settings…", self.open_settings, "Ctrl+,")
         m_file.addSeparator()
-        self._act(m_file, "Quit", self.close, "Ctrl+Q")
+        self._act(m_file, "Quit", self.quit_app, "Ctrl+Q")
         m_edit = mb.addMenu("&Edit")
         self._act(m_edit, "Undo", lambda: self._canvas_call("undo"), "Ctrl+Z")
         self._act(m_edit, "Redo", lambda: self._canvas_call("redo"), "Ctrl+Shift+Z")
@@ -4133,30 +4230,37 @@ class MainWindow(QMainWindow):
         self.tool_bar = tb
         tb.setMovable(False)
         tb.setIconSize(QSize(16, 16))
+        # Two modes: Loupe (look, nothing gets marked) and Mark (the marking tools below).
+        modes = QActionGroup(self)
+        modes.setExclusive(True)
         group = QActionGroup(self)
         group.setExclusive(True)
         self.tool_actions: dict[str, QAction] = {}
         for tool, label, key, tip in TOOL_LIST:
             act = QAction(label, self)
             act.setCheckable(True)
-            act.setToolTip(tip)
-            act.setChecked(tool == self.tool)
+            act.setToolTip(tip if tool == T_INSPECT else tip + "\n(switches to Mark mode)")
             act.triggered.connect(lambda _c=False, t=tool: self.set_tool(t))
-            group.addAction(act)
+            (modes if tool == T_INSPECT else group).addAction(act)
             tb.addAction(act)
             self.tool_actions[tool] = act
+            if tool == T_INSPECT:
+                self.mark_mode_action = QAction("✎ Mark", self)
+                self.mark_mode_action.setCheckable(True)
+                self.mark_mode_action.setToolTip("Mark mode: grease-pencil tools on, hover loupe off\n"
+                                                 "(any tool key, e.g. P or X, also switches here)")
+                self.mark_mode_action.triggered.connect(lambda _c=False: self.set_tool(self.mark_tool))
+                modes.addAction(self.mark_mode_action)
+                tb.addAction(self.mark_mode_action)
+                tb.addSeparator()
+        self.mark_tool = T_STAR
+        self._update_mode_ui()
         tb.addSeparator()
         self.compare_action = QAction("⇋ Compare", self)
         self.compare_action.setCheckable(True)
         self.compare_action.setToolTip("2-up compare  (C)  — hover to change [B]; C / Esc exits")
         self.compare_action.triggered.connect(self._compare_clicked)
         tb.addAction(self.compare_action)
-        self.loupe_action = QAction("Loupe", self)
-        self.loupe_action.setCheckable(True)
-        self.loupe_action.setChecked(True)
-        self.loupe_action.setToolTip("Hover loupe on / off")
-        self.loupe_action.triggered.connect(self._loupe_toggled)
-        tb.addAction(self.loupe_action)
         self.print_action = QAction("Print Sheet", self)
         self.print_action.setToolTip("Print the contact sheet as shown: View size and Show filter  (Ctrl+P)\n"
                                      "Settings ▸ Printing: clean sheet or with your marks, ratings and notes")
@@ -4222,9 +4326,18 @@ class MainWindow(QMainWindow):
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         spacer.setStyleSheet("background: transparent;")
         bb.addWidget(spacer)
-        self.sync_label = QLabel("Not synced yet")
+        self._last_sync = ""
+        self.sync_label = QLabel("Nothing to sync")
         self.sync_label.setStyleSheet("color:#999; padding: 0 8px;")
         bb.addWidget(self.sync_label)
+        self.sync_mode_combo = QComboBox()
+        for key, label in SYNC_MODES:
+            self.sync_mode_combo.addItem(label, key)
+        self.sync_mode_combo.setToolTip("Auto-sync: while you mark (delay in Settings)\n"
+                                         "Sync on close: when a roll or ProofMark closes\n"
+                                         "Manual only: when you press Sync Data")
+        self.sync_mode_combo.currentIndexChanged.connect(lambda _i: self.set_sync_mode(self.sync_mode_combo.currentData()))
+        bb.addWidget(self.sync_mode_combo)
         self.sync_button = QPushButton("⟳  Sync Data")
         self.sync_button.setObjectName("syncButton")
         self.sync_button.setToolTip("Sync marks, ratings, tags and metadata to the sidecars RapidRAW and other\n"
@@ -4315,6 +4428,7 @@ class MainWindow(QMainWindow):
         page.canvas.status.connect(lambda m: self.statusBar().showMessage(m, 5000))
         page.syncJobs.connect(self._forward_jobs)
         page.dirty.connect(self.mark_dirty)
+        page.dirty.connect(self._update_sync_label)
 
     def _forward_jobs(self, jobs: list) -> None:
         for j in jobs:
@@ -4325,17 +4439,38 @@ class MainWindow(QMainWindow):
 
     # ── tool / view state ──────────────────────────────────────────────────
     def set_tool(self, tool: str) -> None:
+        if tool not in self.tool_actions:
+            tool = T_INSPECT
         self.tool = tool
-        self.tool_actions[tool].setChecked(True)
+        if tool != T_INSPECT:
+            self.mark_tool = tool
+        self._update_mode_ui()
         for page in self.pages():
             page.canvas.set_tool(tool)
+            page.canvas.set_loupe_enabled(self._hover_loupe_on())
 
     def _canvas_tool_changed(self, tool: str) -> None:
         self.tool = tool
-        self.tool_actions[tool].setChecked(True)
+        if tool != T_INSPECT:
+            self.mark_tool = tool
+        self._update_mode_ui()
         for page in self.pages():
             if page.canvas.tool != tool:
                 page.canvas.tool = tool
+            page.canvas.set_loupe_enabled(self._hover_loupe_on())
+
+    def _hover_loupe_on(self) -> bool:
+        return self.tool == T_INSPECT and bool(self.cfg.setting("hover_loupe"))
+
+    def _update_mode_ui(self) -> None:
+        """Loupe mode greys the marking tools out; Mark mode turns them on."""
+        loupe = self.tool == T_INSPECT
+        self.tool_actions[T_INSPECT].setChecked(loupe)
+        self.mark_mode_action.setChecked(not loupe)
+        for t, act in self.tool_actions.items():
+            if t != T_INSPECT:
+                act.setEnabled(not loupe)
+        self.tool_actions[self.mark_tool].setChecked(True)
 
     def _compare_clicked(self, checked: bool) -> None:
         page = self.current_page()
@@ -4349,10 +4484,6 @@ class MainWindow(QMainWindow):
         self.compare_action.blockSignals(True)
         self.compare_action.setChecked(on)
         self.compare_action.blockSignals(False)
-
-    def _loupe_toggled(self, on: bool) -> None:
-        for page in self.pages():
-            page.canvas.set_loupe_enabled(on)
 
     def _canvas_call(self, name: str, *args: Any) -> None:
         page = self.current_page()
@@ -4375,7 +4506,8 @@ class MainWindow(QMainWindow):
     def _sync_reported(self, message: str) -> None:
         import datetime
         self.statusBar().showMessage(message, 8000)
-        self.sync_label.setText("Synced " + datetime.datetime.now().strftime("%H:%M"))
+        self._last_sync = datetime.datetime.now().strftime("%H:%M")
+        self._update_sync_label()
         self.sync_label.setToolTip(message)
 
     def _fill_recent_menu(self) -> None:
@@ -4399,9 +4531,10 @@ class MainWindow(QMainWindow):
         if page is None:
             self.statusBar().showMessage("Import a roll first.", 4000)
             return
-        dlg = ExportSelectsDialog(page.roll, self)
-        if dlg.exec() == QDialog.Accepted:
-            QMessageBox.information(self, "Export Selects", dlg.report)
+        def done(dlg: QDialog, result: int) -> None:
+            if result == QDialog.Accepted:
+                QMessageBox.information(self, "Export Selects", dlg.report)  # type: ignore[attr-defined]
+        self._open_window("selects", lambda: ExportSelectsDialog(page.roll, self), done)
 
     def set_view(self, view: str) -> None:
         self.view = view if view in PAPER_INCHES else "full"
@@ -4440,7 +4573,7 @@ class MainWindow(QMainWindow):
         try:
             page = RollPage(self.cfg, folder, camera or prof.get("camera", ""), film or prof.get("film", ""),
                             lens or prof.get("lens", ""), marks, int(self.cfg.setting("default_columns")), self.view,
-                            self.tool, self.loupe_action.isChecked(), extras=extras)
+                            self.tool, self._hover_loupe_on(), extras=extras)
         except OSError as exc:
             QMessageBox.warning(self, "Cannot open roll", f"{folder}\n\n{exc}")
             return None
@@ -4465,19 +4598,61 @@ class MainWindow(QMainWindow):
             return
         page = self.tabs.widget(index)
         if isinstance(page, RollPage):
-            page.flush_sync()
+            if not self._sync_before_closing([page]):
+                return
             page.shutdown()
         self.tabs.removeTab(index)
         if page:
             page.deleteLater()
         self.mark_dirty()
 
+    def _sync_before_closing(self, pages: list) -> bool:
+        """Sync on closing a roll / the app, as the sync mode says. False = the user cancelled."""
+        mode = self.cfg.setting("sync_mode")
+        pending = sum(p.pending for p in pages)
+        if mode == "manual" and pending:
+            ans = QMessageBox.question(
+                self, "Unsynced changes",
+                f"{pending} frame(s) have changes that aren't synced to the sidecars yet.\n\nSync them now?",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes)
+            if ans == QMessageBox.Cancel:
+                return False
+            if ans == QMessageBox.No:
+                return True
+        if mode != "manual" or pending:
+            for p in pages:
+                p.flush_sync()
+        return True
+
+    def set_sync_mode(self, mode: str) -> None:
+        if mode not in SYNC_MODE_NAMES:
+            return
+        self.cfg.set_setting("sync_mode", mode)
+        self.cfg.save()
+        self.sync_mode_combo.blockSignals(True)
+        self.sync_mode_combo.setCurrentIndex(max(0, self.sync_mode_combo.findData(mode)))
+        self.sync_mode_combo.blockSignals(False)
+        if mode == "auto":
+            for page in self.pages():
+                if page.pending:
+                    page._schedule_sync()
+        self._update_sync_label()
+
+    def _update_sync_label(self) -> None:
+        pending = sum(p.pending for p in self.pages())
+        if pending:
+            self.sync_label.setText(f"{pending} frame(s) not synced")
+        elif self._last_sync:
+            self.sync_label.setText("Synced " + self._last_sync)
+        else:
+            self.sync_label.setText("Nothing to sync")
+
     def sync_all(self) -> None:
         if not self.pages():
             self.statusBar().showMessage("Import a roll first.", 4000)
             return
         for page in self.pages():
-            page.flush_sync(everything=True)  # runs even when automatic sync is switched off
+            page.flush_sync(everything=True)  # runs in every sync mode
         self.statusBar().showMessage("Syncing all frames to RapidRAW and .xmp sidecars…", 4000)
 
     # ── dialogs ────────────────────────────────────────────────────────────
@@ -4487,42 +4662,61 @@ class MainWindow(QMainWindow):
         self.cfg.renames.clear()
         self.mark_dirty()
 
+    def _show_from_tray(self) -> None:
+        self.showNormal() if self.isMinimized() else self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self) -> None:
+        """Quit even while a dialog or message box is open (they close first)."""
+        modal = QApplication.activeModalWidget()
+        if modal is not None and modal is not self:
+            modal.close()
+        for dlg in list(self._windows.values()):
+            dlg.close()
+        QTimer.singleShot(0, self.close)
+
+    def _open_window(self, key: str, factory: Callable[[], QDialog],
+                     on_done: Optional[Callable[[QDialog, int], None]] = None) -> QDialog:
+        """
+        Show a dialog as an ordinary window, one of each kind. Unlike a blocking (modal) dialog it
+        doesn't lock the main window, so quitting from the dock or tray still works while it is open.
+        """
+        dlg = self._windows.get(key)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return dlg
+        dlg = factory()
+        dlg.setModal(False)
+
+        def done(result: int, d: QDialog = dlg) -> None:
+            if on_done is not None:
+                on_done(d, result)
+            self._windows.pop(key, None)
+            d.deleteLater()
+        dlg.finished.connect(done)
+        self._windows[key] = dlg
+        dlg.show()
+        return dlg
+
     def open_equipment(self, kind: str = "") -> None:
-        dlg = EquipmentManagerDialog(self.cfg, self)
+        def make() -> QDialog:
+            dlg = EquipmentManagerDialog(self.cfg, self)
+            dlg.changed.connect(self._refresh_all_equipment)
+            return dlg
+        dlg = self._open_window("equipment", make, lambda _d, _r: self._refresh_all_equipment())
         if kind:
-            dlg.select_tab(kind)
-        dlg.changed.connect(self._refresh_all_equipment)
-        dlg.exec()
-        self._refresh_all_equipment()
+            dlg.select_tab(kind)  # type: ignore[attr-defined]
 
     def open_profile(self) -> None:
-        UserProfileDialog(self.cfg, self).exec()
+        self._open_window("profile", lambda: UserProfileDialog(self.cfg, self))
 
     def show_keys(self) -> None:
-        QMessageBox.information(self, "Keyboard Reference", (
-            "TOOLS\n"
-            "P or *  Star           X  Boxed reject      + / -  Exposure push / pull\n"
-            "#  Crop box            R  Squircle ring     L  Line      A  Arrow\n"
-            "E  Adjust (select / move / resize marks)     V or Esc  Inspect\n\n"
-            "PLACING MARKS\n"
-            "Click places at the brush size.  Click-drag draws every mark from the corner you press\n"
-            "towards the cursor, like a box.  Box, arrow and line stay selected so you can drag\n"
-            "their handles.  Adjust tool: click a mark, drag to move, drag handles to resize.\n"
-            "Delete removes the selected mark, arrow keys nudge it (Shift = bigger steps), Esc deselects.\n\n"
-            "BRUSH\n[ / ]  Smaller / larger     Alt+1-4  Red / Toxic green / Silver / Yellow\n"
-            "Pen menu: wax pencil, china marker, felt marker or standard line\n\n"
-            "CULLING  (acts on the frame under the mouse, or the highlighted one after arrow keys)\n"
-            "Arrow keys / Home / End  Move between frames     1-5  Rate     0  Clear rating\n"
-            "Shift+X  Reject / un-reject     N  Frame note     Ctrl+] / Ctrl+[  Rotate     Space  Enlarge\n"
-            "Star colours rate too: green 5, red 5, yellow 4, silver 3 (Settings ▸ Files & Sync)\n\n"
-            "VIEWING\n"
-            "Hover  loupe beside the frame     Click (Inspect) / Right-click / Space  Enlarge to 95%\n"
-            "View  Full screen, or the sheet as it prints on 4×6, 5×7 or 8×10     Show  filter frames\n"
-            "Ctrl+Wheel  Zoom 0.7×–4.5×     Right-drag  Pan     Ctrl+0  Reset zoom\n"
-            "C  2-up compare (hover for [B]); C or Esc exits\n\n"
-            "UNDO\nCtrl+Z  Undo     Ctrl+Shift+Z  Redo     Double-click  Remove the frame's top mark\n\n"
-            "FILE\nCtrl+O Import   Ctrl+P Print   Ctrl+Shift+E PDF   Ctrl+Shift+S Export selects   Ctrl+S Sync Data\n"
-            "Ctrl+, Settings   F11 Full screen"))
+        def make() -> QDialog:
+            box = QMessageBox(QMessageBox.Information, "Keyboard Reference", KEYS_TEXT, QMessageBox.Close, self)
+            return box
+        self._open_window("keys", make)
 
     # ── session persistence ────────────────────────────────────────────────
     def save_session(self) -> None:
@@ -4571,10 +4765,14 @@ class MainWindow(QMainWindow):
             self.cfg.save()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if not self._sync_before_closing(self.pages()):
+            event.ignore()
+            return
         if self._session_ready:
             self.save_session()
-        for page in self.pages():
-            page.flush_sync(everything=bool(self.cfg.setting("sync_on_exit")))
+        for w in QApplication.topLevelWidgets():  # pop-up windows (Help, Settings…) close with the app
+            if w is not self and w.isVisible() and not isinstance(w, QMenu):
+                w.close()
         self.sync_worker.stop()
         self.sync_worker.wait()  # finish writing pending sidecars before quitting
         for page in self.pages():
@@ -4585,16 +4783,20 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def show_about(self, tab: int = 0) -> None:
-        AboutDialog(self.cfg, tab, self).exec()
+        dlg = self._open_window("about", lambda: AboutDialog(self.cfg, tab, self))
+        tabs = dlg.findChild(QTabWidget)
+        if tabs is not None:
+            tabs.setCurrentIndex(tab)
 
     # ── settings ───────────────────────────────────────────────────────────
     def open_settings(self) -> None:
-        dlg = SettingsDialog(self.cfg, self)
-        if dlg.exec():
-            self.apply_settings()
-            if dlg.restart_needed():
-                QMessageBox.information(self, "Restart needed",
-                                        "The interface scale will apply the next time ProofMark starts.")
+        def done(dlg: QDialog, result: int) -> None:
+            if result == QDialog.Accepted:
+                self.apply_settings()
+                if dlg.restart_needed():  # type: ignore[attr-defined]
+                    QMessageBox.information(self, "Restart needed",
+                                            "The interface scale will apply the next time ProofMark starts.")
+        self._open_window("settings", lambda: SettingsDialog(self.cfg, self), done)
 
     def apply_settings(self) -> None:
         c = self.cfg
@@ -4612,12 +4814,16 @@ class MainWindow(QMainWindow):
         self.autosave.setInterval(max(2, int(c.setting("autosave_secs"))) * 1000)
         self.sync_worker.rapidraw_exif = bool(c.setting("rapidraw_exif"))
         self.sync_worker.xmp_sync = bool(c.setting("xmp_sync"))
+        self.set_sync_mode(str(c.setting("sync_mode")))
         STAR_RATINGS.clear()
         STAR_RATINGS.update(DEFAULT_STAR_RATINGS)
         STAR_RATINGS.update({str(k).upper(): int(v) for k, v in (c.setting("star_ratings") or {}).items()})
         for page in self.pages():
             page.canvas.print_header = bool(c.setting("print_header"))
             page.canvas.set_columns(int(c.setting("default_columns")))
+            page.canvas.set_loupe_enabled(self._hover_loupe_on())
+        if self.tray is not None:
+            self.tray.setVisible(bool(c.setting("tray_icon")))
 
     def _apply_layout_prefs(self) -> None:
         area = Qt.BottomToolBarArea if self.cfg.setting("toolbar_area") == "bottom" else Qt.TopToolBarArea
