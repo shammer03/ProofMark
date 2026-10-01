@@ -13,13 +13,16 @@ BuildRequires:  libappstream-glib
 Requires:       python3
 Requires:       python3-pyside6
 Requires:       python3-pillow
-Recommends:     python3-rawpy
 Recommends:     perl-Image-ExifTool
 
 %description
-ProofMark lays out a roll of film scans as a contact sheet with simulated emulsion
-rebate and lets you mark it up with a wax grease pencil. It includes a loupe,
-compare mode, equipment inventory, and clean contact sheet printing.
+ProofMark lays out a roll of film scans as a contact sheet with film rebate and
+frame numbers, and lets you cull it like a darkroom proof: a loupe, red wax
+grease-pencil marks, star ratings and colour labels. Contact sheets print or
+export as PDF or images. Original files are never modified; marks and ratings
+go to sidecar files that RapidRAW and other XMP-aware apps read.
+
+RAW files open when the optional python3 module rawpy is installed (pip).
 
 %prep
 %autosetup -n ProofMark-%{version}
@@ -36,7 +39,6 @@ install -Dpm 0644 packaging/io.github.shammer03.ProofMark.desktop \
     %{buildroot}%{_datadir}/applications/io.github.shammer03.ProofMark.desktop
 install -Dpm 0644 packaging/io.github.shammer03.ProofMark.metainfo.xml \
     %{buildroot}%{_metainfodir}/io.github.shammer03.ProofMark.metainfo.xml
-# 512px icon: generate with `./release.py icon` and commit as packaging/proofmark-512.png
 install -Dpm 0644 packaging/proofmark-512.png \
     %{buildroot}%{_datadir}/icons/hicolor/512x512/apps/io.github.shammer03.ProofMark.png
 

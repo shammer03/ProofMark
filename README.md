@@ -23,7 +23,7 @@ exiftool is optional: it is only used to read RAW files' EXIF the first time a `
     ./release.py bump minor "What changed"    # version, build number, changelog, spec + AppStream
     git commit -am "Release vX.Y.Z" && git tag vX.Y.Z && git push --tags
     ./release.py build                        # dist/: attach proofmark.py + .sha256 to the GitHub release
-    ./release.py icon                         # writes dist/proofmark-512.png (copy to packaging/)
+    ./release.py icon                         # redraws packaging/proofmark-512.png
 
 Set `UPDATE_REPO = "owner/repo"` in proofmark.py (or Settings ▸ Updates) to enable in-app update checks.
 

@@ -17,6 +17,7 @@ Module order (top-down execution safety):
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
@@ -56,7 +57,7 @@ except ImportError:  # pragma: no cover
 from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QThread,
                             QTimer, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontMetrics,
-                           QIcon, QImage, QPainter, QPainterPath, QPen,
+                           QIcon, QLinearGradient, QImage, QPainter, QPainterPath, QPen,
                            QPixmap, QTransform, QRegion, QCursor, QMouseEvent, QWheelEvent)
 from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QApplication, QComboBox,
                                QCompleter, QDialog, QDialogButtonBox,
@@ -444,6 +445,8 @@ class Frame:
         self.label: str = ""                    # colour label: red / yellow / green / blue / purple
         self.thumb0: Optional[QImage] = None    # as decoded, before rotation
         self.preview0: Optional[QImage] = None
+        self.pos0: Optional[tuple[QImage, QImage]] = None  # thumb0 / preview0 as a positive
+        self.pos_lut: Optional[list[int]] = None           # the levels that made them
 
     @property
     def rejected(self) -> bool:
@@ -537,6 +540,7 @@ class Roll:
         self.lab = str(info.get("lab") or "")
         self.note = str(info.get("note") or "")
         self.keywords = [str(k) for k in info.get("keywords") or [] if str(k).strip()]
+        self.positive = bool(info.get("positive"))  # scanned negatives shown as positives
         files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in ALL_EXTS]
         files.sort(key=lambda p: natural_key(p.name))
         extra = [Path(x) for x in info.get("extra") or []]
@@ -583,7 +587,7 @@ class Roll:
         try:
             atomic_write_json(self.note_file, {
                 "version": 2, "title": self.title, "shot_date": self.shot_date, "lab": self.lab,
-                "note": self.note, "keywords": self.keywords,
+                "note": self.note, "keywords": self.keywords, "positive": self.positive,
                 "order": [self.key(i) for i in self.order], "hidden": sorted(self.key(i) for i in self.hidden),
                 "extra": [str(fr.path) for fr in self.frames if fr.path.parent != self.folder]})
         except OSError:
@@ -2525,12 +2529,16 @@ class RollInfoDialog(QDialog):
         self.keywords.setPlaceholderText("Comma separated, e.g. portrait, Emmy, Nashville")
         self.note = QPlainTextEdit(roll.note)
         self.note.setPlaceholderText("Notes for the whole roll: paper, printing ideas…")
+        self.positive = QCheckBox("These scans are negatives: show them as positives")
+        self.positive.setChecked(roll.positive)
+        self.positive.setToolTip("On screen and on printed or exported sheets only. Your files are never changed.")
         form = QFormLayout()
         form.addRow("Title", self.title)
         form.addRow("Shot date", self.date)
         form.addRow("Lab / developer", self.lab)
         form.addRow("Keywords", self.keywords)
         form.addRow("Notes", self.note)
+        form.addRow("", self.positive)
         hint = QLabel("Printed in the sheet header. Keywords become RapidRAW tags and .xmp keywords;\n"
                       "the lab joins the film / camera / lens comment.")
         hint.setStyleSheet("color:#999;")
@@ -2552,6 +2560,10 @@ class RollInfoDialog(QDialog):
         r.keywords = [k.strip() for k in self.keywords.text().split(",") if k.strip()]
         r.note = self.note.toPlainText().strip()
         self.accept()
+
+    @property
+    def wants_positive(self) -> bool:
+        return self.positive.isChecked()
 
 
 class ExportSelectsDialog(QDialog):
@@ -2943,6 +2955,70 @@ def open_any_image(path: Path) -> Image.Image:
     return img.convert("RGB")
 
 
+_cache_pruned = False
+PREVIEW_CACHE_LIMIT = 1500 * 1024 * 1024  # bytes; oldest previews are dropped past this
+
+
+def preview_cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "proofmark" / "previews"
+
+
+def preview_cache_path(path: Path) -> Optional[Path]:
+    """
+    Where the decoded preview of `path` is kept, or None when caching wouldn't help (a small JPEG
+    decodes as fast as its cached copy). The key changes when the file does, so edits are seen.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    if path.suffix.lower() in (".jpg", ".jpeg") and st.st_size < 3 * 1024 * 1024:
+        return None
+    key = hashlib.sha1(f"{path.resolve()}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()
+    return preview_cache_dir() / key[:2] / f"{key}.jpg"
+
+
+def prune_preview_cache(limit: int = PREVIEW_CACHE_LIMIT) -> None:
+    try:
+        files = [(f.stat().st_mtime, f.stat().st_size, f) for f in preview_cache_dir().glob("*/*.jpg")]
+    except OSError:
+        return
+    total = sum(s for _m, s, _f in files)
+    for _m, size, f in sorted(files):
+        if total <= limit:
+            break
+        try:
+            f.unlink()
+            total -= size
+        except OSError:
+            pass
+
+
+def load_preview(path: Path) -> Image.Image:
+    """The frame at preview size, from the cache when it has it."""
+    cached = preview_cache_path(path)
+    if cached is not None and cached.exists():
+        try:
+            with Image.open(cached) as im:
+                im.load()
+                os.utime(cached)  # recently used: kept longest
+                return im.convert("RGB")
+        except (OSError, ValueError):
+            pass
+    preview = open_any_image(path)
+    preview.thumbnail((PREVIEW_W, PREVIEW_H), Image.LANCZOS)
+    if cached is not None:
+        try:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cached.with_suffix(".tmp")
+            preview.save(tmp, "JPEG", quality=92)
+            os.replace(tmp, cached)
+        except OSError:
+            pass
+    return preview
+
+
 class ImageLoaderThread(QThread):
     """Decodes thumbnails (450x320) and previews (1920x1440) off the UI thread."""
 
@@ -2961,13 +3037,15 @@ class ImageLoaderThread(QThread):
 
     def run(self) -> None:
         total = len(self.paths)
+        global _cache_pruned
+        if not _cache_pruned:
+            _cache_pruned = True
+            prune_preview_cache()
         for i, path in enumerate(self.paths):
             if self._abort:
                 return
             try:
-                img = open_any_image(path)
-                preview = img.copy()
-                preview.thumbnail((PREVIEW_W, PREVIEW_H), Image.LANCZOS)
+                preview = load_preview(path)
                 thumb = preview.copy()
                 thumb.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
                 self.frameReady.emit(self.first + i, _pil_to_qimage(thumb), _pil_to_qimage(preview))
@@ -3544,6 +3622,40 @@ def _pil_rgba_to_qimage(im: Image.Image) -> QImage:
     return QImage(im.tobytes(), im.width, im.height, im.width * 4, QImage.Format_RGBA8888).copy()
 
 
+def positive_lut(img: Image.Image) -> list[int]:
+    """
+    Levels that turn a scanned negative into a proofing positive: invert, then stretch each channel
+    between its 0.5% and 99.5% points, which also takes out a colour negative's orange mask.
+    The outer 4% (film holder, rebate) is left out of the measurement.
+    """
+    small = img.convert("RGB")
+    small.thumbnail((600, 600))
+    w, h = small.size
+    small = small.crop((int(w * 0.04), int(h * 0.04), max(int(w * 0.96), 1), max(int(h * 0.96), 1)))
+    hist = small.histogram()
+    cut = small.size[0] * small.size[1] * 0.005
+    lut: list[int] = []
+    for c in range(3):
+        hc = hist[c * 256:(c + 1) * 256]
+        lo, acc = 0, 0.0          # densest tone that counts: becomes white
+        while lo < 255 and acc + hc[lo] <= cut:
+            acc += hc[lo]
+            lo += 1
+        hi, acc = 255, 0.0        # clearest film: becomes black
+        while hi > 0 and acc + hc[hi] <= cut:
+            acc += hc[hi]
+            hi -= 1
+        if hi - lo < 8:
+            lo, hi = 0, 255
+        lut += [round(min(1.0, max(0.0, (hi - v) / (hi - lo))) * 255) for v in range(256)]
+    return lut
+
+
+def as_positive(img: Image.Image, lut: Optional[list[int]] = None) -> Image.Image:
+    img = img.convert("RGB")
+    return img.point(lut or positive_lut(img))
+
+
 def exposure_analysis(preview: QImage) -> dict[str, Any]:
     """Histogram, a clipping overlay (red = blown highlights, blue = blocked shadows) and a focus overlay."""
     im = _qimage_to_pil(preview)
@@ -3869,6 +3981,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         if 0 <= idx < len(self.frames):
             fr = self.frames[idx]
             fr.thumb0, fr.preview0 = thumb, preview
+            fr.pos0 = fr.pos_lut = None
             self._show_rotated(fr)
             self.viewport().update()
 
@@ -3876,12 +3989,36 @@ class ContactSheetCanvas(QAbstractScrollArea):
         """Display images for the frame's rotation (the file itself is never changed)."""
         if fr.thumb0 is None or fr.preview0 is None:
             return
+        thumb0, preview0 = fr.thumb0, fr.preview0
+        if self.roll.positive:
+            if fr.pos0 is None:
+                prev = _qimage_to_pil(fr.preview0)
+                fr.pos_lut = positive_lut(prev)
+                fr.pos0 = (_pil_to_qimage(as_positive(_qimage_to_pil(fr.thumb0), fr.pos_lut)),
+                           _pil_to_qimage(as_positive(prev, fr.pos_lut)))
+            thumb0, preview0 = fr.pos0
         t = QTransform().rotate(90 * fr.rotation)
-        thumb = fr.thumb0.transformed(t) if fr.rotation else fr.thumb0
-        fr.preview = fr.preview0.transformed(t) if fr.rotation else fr.preview0
+        thumb = thumb0.transformed(t) if fr.rotation else thumb0
+        fr.preview = preview0.transformed(t) if fr.rotation else preview0
         fr.thumb = QPixmap.fromImage(thumb)
         fr.aspect = max(0.05, fr.preview.width() / max(1, fr.preview.height()))
         self._pix_cache.pop(fr.path, None)
+
+    def set_positive(self, on: bool) -> None:
+        """Show scanned negatives as positives, on screen and on printed or exported sheets only."""
+        if self.roll.positive == on:
+            return
+        self.roll.positive = on
+        self.roll.save_info()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for fr in self.frames:
+                self._show_rotated(fr)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.viewport().update()
+        if self._overlay is not None:
+            self._overlay.update()
 
     def _rotate(self, idx: int, steps: int) -> None:
         fr = self.frames[idx]
@@ -5175,6 +5312,10 @@ class RollPage(QWidget):
         dlg = RollInfoDialog(self.roll, self)
         if dlg.exec() != QDialog.Accepted:
             return
+        self.canvas.set_positive(dlg.wants_positive)
+        win = self.window()
+        if hasattr(win, "_show_positive_state"):
+            win._show_positive_state()
         self.roll.save_info()
         self.title_label.setText(f"ROLL  {self.roll.display_title}")
         self._mark_info_button()
@@ -5235,7 +5376,8 @@ KEYS_TEXT = (
     "Ctrl+drag a frame  Move it     Alt+arrows  Move the frame     Ctrl+Shift+H  Hide / show on the sheet\n"
     "Frame menu: reverse, sort by name, add photos (or drop files on the window)     Ctrl+I  Roll Info\n\n"
     "EXPOSURE (in the 60% / 95% loupe)\n"
-    "H  Histogram     J  Clipping warnings     F  Focus highlighting\n\n"
+    "H  Histogram     J  Clipping warnings     F  Focus highlighting\n"
+    "Ctrl+Shift+N  Show scanned negatives as positives (on screen and on sheets; files never change)\n\n"
     "VIEWING  (the same in Loupe and Mark mode)\n"
     "Hover  60% view beside the frame     Click  60% / 95%     Esc  Back\n"
     "Mark mode: double-click a photo  Remove its newest mark (again for the one before)\n"
@@ -5382,6 +5524,13 @@ class MainWindow(QMainWindow):
             act.setChecked(bool(self.cfg.setting(key)))
             act.toggled.connect(lambda on, k=key: self.set_exposure_tool(k, on))
             self.expo_actions[key] = act
+        m_view.addSeparator()
+        self.positive_action = m_view.addAction("Show Negatives as Positives")
+        self.positive_action.setShortcut("Ctrl+Shift+N")
+        self.positive_action.setCheckable(True)
+        self.positive_action.setToolTip("For scanned negatives: shows this roll as positives on screen and on\n"
+                                        "printed or exported sheets. Your files are never changed.")
+        self.positive_action.toggled.connect(self._set_positive)
         m_eq = mb.addMenu("&Equipment")
         self._act(m_eq, "Equipment Inventory…", self.open_equipment, "Ctrl+E")
         self._act(m_eq, "User Profile && Defaults…", self.open_profile, "Ctrl+Shift+P")
@@ -5821,8 +5970,22 @@ class MainWindow(QMainWindow):
             page.canvas.set_view(self.view)
         self.mark_dirty()
 
+    def _set_positive(self, on: bool) -> None:
+        page = self.current_page()
+        if page is not None:
+            page.canvas.set_positive(on)
+            self.statusBar().showMessage("Negatives shown as positives" if on else "Showing the scans as they are", 4000)
+
+    def _show_positive_state(self) -> None:
+        page = self.current_page()
+        self.positive_action.blockSignals(True)
+        self.positive_action.setChecked(bool(page and page.roll.positive))
+        self.positive_action.setEnabled(page is not None)
+        self.positive_action.blockSignals(False)
+
     def _tab_changed(self, _i: int) -> None:
         page = self.current_page()
+        self._show_positive_state()
         if page:
             self._canvas_compare_changed(page.canvas.compare)
             page.canvas.setFocus()
@@ -5831,6 +5994,8 @@ class MainWindow(QMainWindow):
     # ── roll management ────────────────────────────────────────────────────
     def _refresh_central(self) -> None:
         """The welcome page while no roll is open, the roll tabs otherwise."""
+        if hasattr(self, "positive_action"):
+            self._show_positive_state()
         if self.tabs.count():
             self.central.setCurrentWidget(self.tabs)
         else:
@@ -6311,6 +6476,8 @@ class MainWindow(QMainWindow):
             if fr.path not in cache:
                 try:
                     img = open_any_image(fr.path)
+                    if page.roll.positive:
+                        img = as_positive(img, fr.pos_lut)
                     if fr.rotation:
                         img = img.rotate(-90 * fr.rotation, expand=True)
                     img.thumbnail((long_px, long_px), Image.LANCZOS)
@@ -6404,30 +6571,57 @@ class MainWindow(QMainWindow):
 # ── Fedora integration ──────────────────────────────────────────────────────
 
 def build_icon_pixmap(size: int = 512) -> QPixmap:
+    """The app icon: a black-and-white negative, one frame ringed in red wax."""
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
     s = float(size)
-    path = QPainterPath()
-    path.addRoundedRect(QRectF(s * 0.04, s * 0.04, s * 0.92, s * 0.92), s * 0.16, s * 0.16)
-    p.fillPath(path, QColor("#141414"))
-    p.setPen(QPen(C_AMBER, s * 0.025))
-    p.drawPath(path)
-    # contact-sheet frames
+    base = QPainterPath()
+    base.addRoundedRect(QRectF(s * 0.06, s * 0.09, s * 0.88, s * 0.85), s * 0.17, s * 0.17)
+    p.fillPath(base, QColor("#0c0c0c"))
+    face = QPainterPath()
+    face.addRoundedRect(QRectF(s * 0.06, s * 0.06, s * 0.88, s * 0.84), s * 0.17, s * 0.17)
+    g = QLinearGradient(0, s * 0.06, 0, s * 0.9)
+    g.setColorAt(0, QColor("#3a3a3a"))
+    g.setColorAt(1, QColor("#1c1c1c"))
+    p.fillPath(face, g)
+    p.setClipPath(face)
+    # the strip: clear film base with sprocket holes
+    strip = QRectF(s * 0.12, s * 0.26, s * 0.76, s * 0.46)
+    p.fillRect(strip, QColor("#b9b9b4"))
     p.setPen(Qt.NoPen)
-    for r in range(2):
-        for c in range(3):
-            p.fillRect(QRectF(s * (0.15 + c * 0.235), s * (0.17 + r * 0.28), s * 0.2, s * 0.2), QColor("#2a2a2a"))
-            p.fillRect(QRectF(s * (0.15 + c * 0.235), s * (0.375 + r * 0.28), s * 0.2, s * 0.02), C_AMBER_DIM)
-    # rebate strip
-    p.fillRect(QRectF(s * 0.12, s * 0.75, s * 0.76, s * 0.06), QColor("#050505"))
-    draw_barcode(p, QRectF(s * 0.62, s * 0.762, s * 0.24, s * 0.036), "|!| |!!| ! |.|!| |!|", C_AMBER)
-    # grease star
-    cx, cy, r = s * 0.5, s * 0.37, s * 0.19
-    star = [QPointF(cx + r * math.cos(-math.pi / 2 + 4 * math.pi / 5 * i),
-                    cy + r * math.sin(-math.pi / 2 + 4 * math.pi / 5 * i)) for i in range(6)]
-    render_pen_strokes(p, [star], s * 0.03, C_GREASE, 42, "wax")
+    p.setBrush(QColor("#2a2a2a"))
+    step = strip.width() / 6
+    for y in (strip.top() + s * 0.03, strip.bottom() - s * 0.07):
+        for i in range(6):
+            p.drawRoundedRect(QRectF(strip.left() + i * step + step * 0.22, y, step * 0.56, s * 0.04), s * 0.01, s * 0.01)
+    # the frame as it looks on the negative: dense sky, dark sun, clear ground
+    r = QRectF(s * 0.2, s * 0.34, s * 0.6, s * 0.3)
+    p.save()
+    p.setClipRect(r, Qt.IntersectClip)
+    sky = QLinearGradient(0, r.top(), 0, r.bottom())
+    sky.setColorAt(0, QColor("#3a3a3a"))
+    sky.setColorAt(1, QColor("#555555"))
+    p.fillRect(r, sky)
+    p.setBrush(QColor("#111111"))
+    d = r.width() * 0.16
+    p.drawEllipse(QPointF(r.left() + r.width() * 0.72, r.top() + r.height() * 0.3), d / 2, d / 2)
+    hill = QPainterPath(QPointF(r.left(), r.bottom()))
+    hill.lineTo(r.left(), r.top() + r.height() * 0.62)
+    hill.cubicTo(r.left() + r.width() * 0.3, r.top() + r.height() * 0.42,
+                 r.left() + r.width() * 0.6, r.top() + r.height() * 0.78, r.right(), r.top() + r.height() * 0.58)
+    hill.lineTo(r.right(), r.bottom())
+    hill.closeSubpath()
+    p.fillPath(hill, QColor("#d6d6d6"))
+    p.restore()
+    # the wax ring, drawn a little past a full turn like a quick hand
+    ring = []
+    for i in range(91):
+        a = -0.35 + 2 * math.pi * 1.15 * i / 90
+        wob = 1 + 0.04 * math.sin(3 * a + 7) + 0.03 * i / 90
+        ring.append(QPointF(s * 0.5 + s * 0.36 * wob * math.cos(a), s * 0.49 + s * 0.27 * wob * math.sin(a)))
+    render_pen_strokes(p, [ring], s * 0.05, QColor("#E8352B"), 7, "wax")
     p.end()
     return pm
 
@@ -6444,7 +6638,11 @@ def _desktop_dir() -> Path:
     return Path.home() / "Desktop"
 
 
-def install_desktop_integration(force: bool = False, desktop_shortcut: bool = False) -> bool:
+ICON_REV = 2  # bump when build_icon_pixmap changes, so installed copies are redrawn
+
+
+def install_desktop_integration(force: bool = False, desktop_shortcut: bool = False,
+                                refresh_icon: bool = False) -> bool:
     """
     Write proofmark.desktop (app menu) and proofmark.png, and optionally place a clickable
     launcher on the Desktop, marked executable + trusted so GNOME/KDE run it on double-click.
@@ -6463,7 +6661,7 @@ def install_desktop_integration(force: bool = False, desktop_shortcut: bool = Fa
             "Comment=Darkroom contact sheet marking with wax grease pencil\n"
             f'Exec="{sys.executable}" "{script}"\nPath={script.parent}\nIcon={icon_path}\nTerminal=false\n'
             "Categories=Graphics;Photography;\nStartupWMClass=proofmark\nStartupNotify=true\n")
-        if force or not icon_path.exists():
+        if force or refresh_icon or not icon_path.exists():
             build_icon_pixmap(512).save(str(icon_path), "PNG")
         targets = [app_dir / "proofmark.desktop"]
         if desktop_shortcut:
@@ -6516,8 +6714,10 @@ def main() -> int:
     set_accent(str(cfg.setting("accent")))
     app.setStyleSheet(build_style(str(cfg.setting("font_family")), int(cfg.setting("font_size")), ACCENT_HEX))
     first_time = not cfg.data.get("desktop_shortcut_made", False)
-    if install_desktop_integration(desktop_shortcut=first_time) and first_time:
+    new_icon = cfg.data.get("icon_rev") != ICON_REV
+    if install_desktop_integration(desktop_shortcut=first_time, refresh_icon=new_icon) and (first_time or new_icon):
         cfg.data["desktop_shortcut_made"] = True  # only auto-create once
+        cfg.data["icon_rev"] = ICON_REV
         cfg.save()
     app.setWindowIcon(QIcon(build_icon_pixmap(256)))
     win = MainWindow(cfg)

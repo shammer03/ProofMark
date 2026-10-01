@@ -117,7 +117,7 @@ def cmd_build() -> None:
 
 def cmd_icon() -> None:
     DIST.mkdir(exist_ok=True)
-    subprocess.run([sys.executable, str(APP), "--export-icon", str(DIST / "proofmark-512.png")], check=True)
+    subprocess.run([sys.executable, str(APP), "--export-icon", str(PKG / "proofmark-512.png")], check=True)
 
 
 def main() -> None:

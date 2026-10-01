@@ -7,13 +7,16 @@
   <summary>Darkroom contact-sheet proofing with wax grease-pencil marks</summary>
   <developer_name>S. Hambrick</developer_name>
   <description>
-    <p>ProofMark lays out a roll of film scans as a contact sheet with simulated emulsion rebate and lets you mark it up the way you would in the darkroom, with a wax grease pencil.</p>
+    <p>ProofMark lays out a roll of film scans as a contact sheet, with film rebate and frame numbers, and lets you cull it the way you would a darkroom proof: under a loupe, with a red wax grease pencil.</p>
     <ul>
-      <li>Star picks, rejects, exposure push and pull, crop boxes, rings, arrows and lines</li>
-      <li>Hover loupe with magnification and side-by-side compare</li>
-      <li>Film, camera and lens inventory with favorites</li>
-      <li>One-click clean print and PDF export of the contact sheet</li>
-      <li>XMP and EXIF sidecar sync, RAW support</li>
+      <li>Loupe that follows the cursor and zooms to 200%, with histogram, clipping and focus highlighting</li>
+      <li>Grease-pencil marks: stars, rejects, crop boxes, rings, arrows, lines and push or pull notes</li>
+      <li>Star ratings, colour labels and frame notes from the keyboard, with undo and redo</li>
+      <li>Side-by-side compare, a Show filter, and frames you can reorder, hide or rotate</li>
+      <li>Shows scanned negatives as positives for proofing</li>
+      <li>Prints or exports the contact sheet as PDF, JPEG, TIFF or PNG</li>
+      <li>Roll info, film, camera and lens inventory, and RAW support</li>
+      <li>Never modifies your photos: marks, ratings and metadata go to sidecar files that RapidRAW and other XMP-aware apps read</li>
     </ul>
   </description>
   <launchable type="desktop-id">io.github.shammer03.ProofMark.desktop</launchable>
