@@ -43,6 +43,7 @@ except ImportError:  # RAW support degrades gracefully
     rawpy = None
 
 from PySide6.QtCore import QMarginsF, QProcess, QSizeF, QUrl
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtGui import QDesktopServices, QPageLayout, QPageSize
 from PySide6.QtWidgets import QCheckBox, QColorDialog, QFontComboBox, QPlainTextEdit, QTextBrowser, QToolButton
 
@@ -830,10 +831,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "default_columns": 6, "hover_loupe": True,
     "autosave_secs": 4, "sync_mode": "auto", "sync_delay": 2, "rapidraw_exif": True, "xmp_sync": True,
     "star_ratings": dict(DEFAULT_STAR_RATINGS), "print_marks": False, "tray_icon": True,
-    "sideways_verticals": False, "number_style": "edge", "number_start": 1,
+    "sideways_verticals": True, "number_style": "edge", "number_start": 1,
     "export_mode": "ask", "export_folder": str(Path.home() / "Pictures" / "Contact Sheets"),
     "export_format": "jpg", "export_size": 8000, "export_fullres": False,
-    "histogram": False, "clipping": False, "peaking": False,
+    "histogram": False, "clipping": False, "peaking": False, "toolbar_style": "icons",
     "print_direct": False, "print_ink_saver": False, "print_header": True,
     "auto_update_check": True, "update_repo": "",
 }
@@ -2200,7 +2201,13 @@ class SettingsDialog(QDialog):
         fa.addRow("Interface scale", self.scale)
         fa.addRow("Accent colour", self.accent_btn)
         fa.addRow("Menu bar", self.menu_mode)
+        self.tb_style = QComboBox()
+        self.tb_style.addItem("Icons (hover for their names)", "icons")
+        self.tb_style.addItem("Icons and names", "both")
+        self.tb_style.addItem("Names only", "text")
+        self.tb_style.setCurrentIndex(max(0, self.tb_style.findData(s("toolbar_style"))))
         fa.addRow("Toolbars", self.tb_area)
+        fa.addRow("Toolbar buttons", self.tb_style)
         fa.addRow("Film-edge text size", self.rebate)
         self.tray_icon = QCheckBox("Show a ProofMark icon in the system tray (Show / Sync Data / Quit)")
         self.tray_icon.setChecked(bool(s("tray_icon")))
@@ -2403,6 +2410,7 @@ class SettingsDialog(QDialog):
             "font_family": "" if self.sys_font.isChecked() else self.font_combo.currentFont().family(),
             "font_size": self.font_size.value(), "ui_scale": self.scale.value(), "accent": self._accent,
             "menu_mode": self.menu_mode.currentData(), "toolbar_area": self.tb_area.currentData(),
+            "toolbar_style": self.tb_style.currentData(),
             "rebate_scale": self.rebate.value(), "default_columns": self.cols.value(),
             "tray_icon": self.tray_icon.isChecked(),
             "hover_loupe": self.hover_loupe.isChecked(), "autosave_secs": self.autosave.value(),
@@ -2610,6 +2618,133 @@ class UpdateDialog(QDialog):
         row.addWidget(page)
         row.addWidget(later)
         lay.addLayout(row)
+
+
+# ── Toolbar icons: GNOME (Adwaita) symbolic icons, plus drawn ones for the grease-pencil tools ──
+
+ADWAITA_SYMBOLIC = [Path(d) / "icons" / "Adwaita" / "symbolic"
+                    for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") + ["/usr/share"]]
+
+
+def _adwaita_svg(name: str) -> Optional[Path]:
+    for base in ADWAITA_SYMBOLIC:
+        for sub in ("actions", "status", "devices", "categories", "ui", "places", "apps"):
+            f = base / sub / f"{name}-symbolic.svg"
+            if f.exists():
+                return f
+    return None
+
+
+def _draw_glyph(kind: str, p: QPainter, s: float) -> None:
+    """Icons for ProofMark's own tools, drawn like the marks they make (s = icon size)."""
+    m = s * 0.16
+    if kind == "star":
+        pts = [QPointF(s / 2 + s * 0.42 * math.cos(-math.pi / 2 + 4 * math.pi / 5 * i),
+                       s / 2 + 0.04 * s + s * 0.42 * math.sin(-math.pi / 2 + 4 * math.pi / 5 * i)) for i in range(6)]
+        p.drawPolyline(pts)
+    elif kind == "reject":
+        r = QRectF(m, m, s - 2 * m, s - 2 * m)
+        p.drawRect(r)
+        p.drawLine(r.topLeft(), r.bottomRight())
+        p.drawLine(r.topRight(), r.bottomLeft())
+    elif kind in ("push", "pull"):
+        p.drawLine(QPointF(m, s / 2), QPointF(s - m, s / 2))
+        if kind == "push":
+            p.drawLine(QPointF(s / 2, m), QPointF(s / 2, s - m))
+    elif kind == "crop":
+        a, b = s * 0.3, s * 0.7
+        for x in (a, b):
+            p.drawLine(QPointF(x, m * 0.5), QPointF(x, s - m * 0.5))
+        for y in (a, b):
+            p.drawLine(QPointF(m * 0.5, y), QPointF(s - m * 0.5, y))
+    elif kind == "line":
+        path = QPainterPath(QPointF(m, s * 0.65))
+        path.cubicTo(QPointF(s * 0.35, s * 0.2), QPointF(s * 0.55, s * 0.9), QPointF(s - m, s * 0.35))
+        p.drawPath(path)
+    elif kind == "arrow":
+        a, b = QPointF(m, s - m), QPointF(s - m, m)
+        p.drawLine(a, b)
+        p.drawPolyline([QPointF(s - m - s * 0.32, m), b, QPointF(s - m, m + s * 0.32)])
+    elif kind == "ring":
+        p.drawRoundedRect(QRectF(m, m * 1.4, s - 2 * m, s - 2.8 * m), s * 0.22, s * 0.22)
+    elif kind == "move":
+        c, e = s / 2, s * 0.13
+        p.drawLine(QPointF(m * 0.6, c), QPointF(s - m * 0.6, c))
+        p.drawLine(QPointF(c, m * 0.6), QPointF(c, s - m * 0.6))
+        for x, y, dx, dy in ((m * 0.6, c, 1, 0), (s - m * 0.6, c, -1, 0), (c, m * 0.6, 0, 1), (c, s - m * 0.6, 0, -1)):
+            p.drawPolyline([QPointF(x + dx * e + dy * e, y + dy * e + dx * e), QPointF(x, y),
+                            QPointF(x + dx * e - dy * e, y + dy * e - dx * e)])
+    elif kind == "brush":  # brush size: a small and a large dot
+        p.setBrush(p.pen().color())
+        p.drawEllipse(QPointF(s * 0.28, s * 0.62), s * 0.1, s * 0.1)
+        p.drawEllipse(QPointF(s * 0.66, s * 0.5), s * 0.22, s * 0.22)
+    elif kind == "filter":  # a funnel
+        p.drawPolygon([QPointF(m, m * 1.2), QPointF(s - m, m * 1.2), QPointF(s * 0.58, s * 0.55),
+                       QPointF(s * 0.58, s - m), QPointF(s * 0.42, s - m * 1.6), QPointF(s * 0.42, s * 0.55)])
+
+
+_ICON_CACHE: dict[str, QIcon] = {}
+
+
+def tool_icon(name: str) -> Optional[QIcon]:
+    """
+    "adw:<gnome icon>" or "tool:<glyph>": light on the dark bar, black on the orange checked button,
+    dim when disabled. None when the GNOME icon isn't installed (the button keeps its text).
+    """
+    if name in _ICON_CACHE:
+        return _ICON_CACHE[name]
+    svg: Optional[QSvgRenderer] = None
+    if name.startswith("adw:"):
+        f = _adwaita_svg(name[4:])
+        if f is None:
+            return None
+        svg = QSvgRenderer(str(f))
+    icon = QIcon()
+    shades = ((QIcon.Normal, QIcon.Off, "#DDDDDD"), (QIcon.Active, QIcon.Off, "#FFFFFF"),
+              (QIcon.Normal, QIcon.On, "#000000"), (QIcon.Active, QIcon.On, "#000000"),
+              (QIcon.Disabled, QIcon.Off, "#4A4A4A"), (QIcon.Disabled, QIcon.On, "#7A6440"))
+    for size in (16, 20, 24, 32, 48):
+        for mode, state, colour in shades:
+            img = QImage(size, size, QImage.Format_ARGB32_Premultiplied)
+            img.fill(Qt.transparent)
+            p = QPainter(img)
+            p.setRenderHint(QPainter.Antialiasing)
+            if svg is not None:
+                svg.render(p, QRectF(0, 0, size, size))
+                p.setCompositionMode(QPainter.CompositionMode_SourceIn)  # recolour the black symbolic icon
+                p.fillRect(img.rect(), QColor(colour))
+            else:
+                pen = QPen(QColor(colour), max(1.4, size / 11), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                p.setPen(pen)
+                p.setBrush(Qt.NoBrush)
+                _draw_glyph(name[5:], p, float(size))
+            p.end()
+            icon.addPixmap(QPixmap.fromImage(img), mode, state)
+    _ICON_CACHE[name] = icon
+    return icon
+
+
+TOOL_ICONS = {T_INSPECT: "adw:system-search", T_STAR: "tool:star", T_REJECT: "tool:reject", T_PUSH: "tool:push",
+              T_PULL: "tool:pull", T_CROP: "tool:crop", T_LINE: "tool:line", T_ARROW: "tool:arrow",
+              T_RING: "tool:ring", T_ADJUST: "tool:move"}
+
+
+class IconLabel(QLabel):
+    """A toolbar caption that shows an icon (with its words in the tooltip) or the words themselves."""
+
+    def __init__(self, text: str, icon: str, tip: str) -> None:
+        super().__init__(text)
+        self.words, self.icon_name = text, icon
+        self.setToolTip(tip)
+
+    def set_icon_mode(self, on: bool) -> None:
+        ic = tool_icon(self.icon_name) if on else None
+        if ic is not None:
+            self.setPixmap(ic.pixmap(QSize(18, 18)))
+            self.setContentsMargins(6, 0, 2, 0)
+        else:
+            self.setText(self.words)
+            self.setContentsMargins(0, 0, 0, 0)
 
 
 class JumpSlider(QSlider):
@@ -3467,7 +3602,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
 
     Interaction map (the same in Loupe and Mark mode, except that only Mark mode draws)
       hover            -> 60% view beside the frame
-      click            -> switch 60% / 95% enlarged view (double-click = click); right-click / Space too
+      click            -> switch 60% / 95% enlarged view; right-click / Space too
+      double-click     -> Mark mode: remove that photo's newest mark (the click's zoom is taken back)
       wheel            -> while a view shows: grow it to 95%, then magnify the photo to 200%
       drag (Mark mode) -> draw a mark from the press point
       drag (Loupe mode)/right-drag -> move a magnified photo
@@ -3528,6 +3664,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._kbd_nav = False             # last frame choice came from the keyboard
         self._overlay: Optional["LoupeOverlay"] = None  # draws the 60% / 95% views over the whole window
         self._move_drag: Optional[dict[str, int]] = None  # Ctrl+drag of a frame to a new place
+        self._before_click: Optional[tuple] = None  # view before the last click (a double-click restores it)
         self.show_hist = self.show_clip = self.show_peak = False  # exposure tools in the loupe
         self._expo: "OrderedDict[tuple, dict[str, Any]]" = OrderedDict()
         self._press: Optional[dict[str, Any]] = None  # a press waiting to be a click (zoom) or a drag (draw)
@@ -4419,6 +4556,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
 
     def _toggle_zoom(self, press: dict[str, Any]) -> None:
         """A click: switch between the 60% view and the 95% enlarged view (same in both modes)."""
+        self._before_click = (self.loupe_locked, self.locked_index, self.mag, self.focus)  # for a double-click
         if self.loupe_locked:
             self.loupe_locked = False
         elif 0 <= press["idx"] < len(self.frames):
@@ -4559,9 +4697,25 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.viewport().update()
 
     def mouseDoubleClickEvent(self, e) -> None:  # noqa: N802
-        # Same in both modes: a double-click is just a click (the first click already zoomed),
-        # so double-clicking a photo enlarges it. It never adds or removes marks.
+        """
+        Loupe mode: a double-click is just a click (the first click already zoomed).
+        Mark mode: it removes that photo's newest mark (again for the one before), and takes back
+        the zoom the first click did, so the view stays where it was.
+        """
         e.accept()
+        if e.button() != Qt.LeftButton or self.compare or self.tool in (T_INSPECT, T_ADJUST):
+            return
+        if self._before_click is not None:
+            self.loupe_locked, self.locked_index, self.mag, self.focus = self._before_click
+            self._before_click = None
+        pos = e.position()
+        target = self._target_at(pos)
+        idx = target[0] if target else self.cell_at(pos)
+        if 0 <= idx < len(self.frames) and self.frames[idx].marks:
+            self._remove_mark(idx, self.frames[idx].marks[-1])
+            self.status.emit(f"Frame {self.roll.label(idx)}: newest mark removed  "
+                             f"({len(self.frames[idx].marks)} left; Ctrl+Z brings it back)")
+        self.viewport().update()
 
     def wheelEvent(self, e) -> None:  # noqa: N802
         pos = e.position()
@@ -4975,7 +5129,8 @@ KEYS_TEXT = (
     "EXPOSURE (in the 60% / 95% loupe)\n"
     "H  Histogram     J  Clipping warnings     F  Focus highlighting\n\n"
     "VIEWING  (the same in Loupe and Mark mode)\n"
-    "Hover  60% view beside the frame     Click (or double-click)  60% / 95%     Esc  Back\n"
+    "Hover  60% view beside the frame     Click  60% / 95%     Esc  Back\n"
+    "Mark mode: double-click a photo  Remove its newest mark (again for the one before)\n"
     "Wheel  Grow the view to 95%, then magnify the photo to 200% (stops at 75 / 95 / 150 / 200%)\n"
     "Shift+Wheel  Scroll the sheet     Drag (Loupe) / right-drag  Move a magnified photo     Ctrl+0  Back to 95%\n"
     "View  Full screen, or the sheet as it prints on 4×6, 5×7 or 8×10     Show  filter frames\n"
@@ -5028,6 +5183,10 @@ class MainWindow(QMainWindow):
         self.autosave.timeout.connect(self._autosave_tick)
         self.autosave.start()
         self.statusBar().addPermanentWidget(QLabel(f"v{version_string()}  "))
+        if not self.cfg.data.get("sideways_default_on"):  # 1.3.1: lay vertical frames sideways by default
+            self.cfg.set_setting("sideways_verticals", True)
+            self.cfg.data["sideways_default_on"] = True
+            self.cfg.save()
         self.tray: Optional[QSystemTrayIcon] = None
         if QSystemTrayIcon.isSystemTrayAvailable():  # GNOME needs the AppIndicator extension for this
             self.tray = QSystemTrayIcon(QIcon(build_icon_pixmap(64)), self)
@@ -5052,6 +5211,10 @@ class MainWindow(QMainWindow):
         self._act(m_file, "Close Roll", lambda: self.close_tab(self.tabs.currentIndex()), "Ctrl+W")
         m_file.addSeparator()
         self._act(m_file, "Print Contact Sheet…", self.print_sheet, "Ctrl+P")
+        self.ink_action = m_file.addAction("Save Ink When Printing (white background)")
+        self.ink_action.setCheckable(True)
+        self.ink_action.setToolTip("Print and export on white instead of the black film base")
+        self.ink_action.toggled.connect(self._set_ink_saver)
         self._act(m_file, "Export Contact Sheet as PDF…", self.export_pdf, "Ctrl+Shift+E")
         self._act(m_file, "Export Contact Sheet as Image…", self.export_image, "Ctrl+Alt+E")
         self._act(m_file, "Open Export Folder", self.open_export_folder)
@@ -5119,7 +5282,7 @@ class MainWindow(QMainWindow):
         tb = self.addToolBar("Tools")
         self.tool_bar = tb
         tb.setMovable(False)
-        tb.setIconSize(QSize(16, 16))
+        tb.setIconSize(QSize(20, 20))
         # Two modes: Loupe (look, nothing gets marked) and Mark (the marking tools below).
         modes = QActionGroup(self)
         modes.setExclusive(True)
@@ -5127,7 +5290,10 @@ class MainWindow(QMainWindow):
         group.setExclusive(True)
         self.tool_actions: dict[str, QAction] = {}
         for tool, label, key, tip in TOOL_LIST:
-            act = QAction(label, self)
+            act = QAction(label.split(" ", 1)[-1], self)  # plain name; the icon carries the picture
+            ic = tool_icon(TOOL_ICONS.get(tool, ""))
+            if ic is not None:
+                act.setIcon(ic)
             act.setCheckable(True)
             act.setToolTip(tip if tool == T_INSPECT else tip + "\n(switches to Mark mode)")
             act.triggered.connect(lambda _c=False, t=tool: self.set_tool(t))
@@ -5135,7 +5301,10 @@ class MainWindow(QMainWindow):
             tb.addAction(act)
             self.tool_actions[tool] = act
             if tool == T_INSPECT:
-                self.mark_mode_action = QAction("✎ Mark", self)
+                self.mark_mode_action = QAction("Mark", self)
+                _ic = tool_icon("adw:document-edit")
+                if _ic is not None:
+                    self.mark_mode_action.setIcon(_ic)
                 self.mark_mode_action.setCheckable(True)
                 self.mark_mode_action.setToolTip("Mark mode: grease-pencil tools on. Hover still magnifies;\n"
                                                  "Space or right-click enlarges a frame to mark it up close\n"
@@ -5147,24 +5316,36 @@ class MainWindow(QMainWindow):
         self.mark_tool = T_STAR
         self._update_mode_ui()
         tb.addSeparator()
-        self.compare_action = QAction("⇋ Compare", self)
+        self.compare_action = QAction("Compare", self)
+        _ic = tool_icon("adw:view-dual")
+        if _ic is not None:
+            self.compare_action.setIcon(_ic)
         self.compare_action.setCheckable(True)
         self.compare_action.setToolTip("2-up compare  (C)  — hover to change [B]; C / Esc exits")
         self.compare_action.triggered.connect(self._compare_clicked)
         tb.addAction(self.compare_action)
-        for text, steps, tip in (("⟲", -1, "Rotate the frame counter-clockwise  (Ctrl+[)"),
-                                 ("⟳", 1, "Rotate the frame clockwise  (Ctrl+])")):
+        for text, steps, tip in (("Rotate left", -1, "Rotate the frame counter-clockwise  (Ctrl+[)"),
+                                 ("Rotate right", 1, "Rotate the frame clockwise  (Ctrl+])")):
             act = QAction(text, self)
+            ic = tool_icon("adw:object-rotate-left" if steps < 0 else "adw:object-rotate-right")
+            if ic is not None:
+                act.setIcon(ic)
             act.setToolTip(tip + "\nActs on the enlarged frame, or the last one you clicked. Display only.")
             act.triggered.connect(lambda _c=False, n=steps: self._canvas_call("rotate_frame", n))
             tb.addAction(act)
         self.print_action = QAction("Print Sheet", self)
+        _ic = tool_icon("adw:printer")
+        if _ic is not None:
+            self.print_action.setIcon(_ic)
+
         self.print_action.setToolTip("Print the contact sheet as shown: View size and Show filter  (Ctrl+P)\n"
                                      "Settings ▸ Printing: clean sheet or with your marks, ratings and notes")
         self.print_action.triggered.connect(lambda _c=False: self.print_sheet())
         tb.addAction(self.print_action)
         tb.addSeparator()
-        tb.addWidget(QLabel(" View "))
+        self.icon_labels: list[IconLabel] = []
+        self.icon_labels.append(IconLabel(" View ", "adw:document-print-preview", "View: Full screen or a print size"))
+        tb.addWidget(self.icon_labels[-1])
         self.view_combo = QComboBox()
         for key, label in VIEW_MODES:
             self.view_combo.addItem(label, key)
@@ -5172,7 +5353,8 @@ class MainWindow(QMainWindow):
                                    "Print sizes show the contact sheet exactly as it prints on that paper.")
         self.view_combo.currentIndexChanged.connect(lambda _i: self.set_view(self.view_combo.currentData()))
         tb.addWidget(self.view_combo)
-        tb.addWidget(QLabel(" Show "))
+        self.icon_labels.append(IconLabel(" Show ", "tool:filter", "Show: which frames are on the sheet"))
+        tb.addWidget(self.icon_labels[-1])
         self.filter_combo = QComboBox()
         for key, label in FILTERS:
             self.filter_combo.addItem(label, key)
@@ -5185,8 +5367,9 @@ class MainWindow(QMainWindow):
         bb = self.addToolBar("Brush")
         self.brush_bar = bb
         bb.setMovable(False)
-        bb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        bb.addWidget(QLabel("Brush size"))
+        bb.setIconSize(QSize(20, 20))
+        self.icon_labels.append(IconLabel("Brush size", "tool:brush", "Brush size"))
+        bb.addWidget(self.icon_labels[-1])
         self.size_slider = JumpSlider(Qt.Horizontal)
         self.size_slider.setRange(25, int(BRUSH_MAX * 100))
         self.size_slider.detents = BRUSH_DETENTS
@@ -5199,7 +5382,8 @@ class MainWindow(QMainWindow):
         self.size_label.setMinimumWidth(48)
         bb.addWidget(self.size_label)
         bb.addSeparator()
-        bb.addWidget(QLabel("Wax colour"))
+        self.icon_labels.append(IconLabel("Wax colour", "adw:color-select", "Wax colour"))
+        bb.addWidget(self.icon_labels[-1])
         cgroup = QActionGroup(self)
         cgroup.setExclusive(True)
         self.color_actions: dict[str, QAction] = {}
@@ -5213,7 +5397,8 @@ class MainWindow(QMainWindow):
             self.color_actions[chex] = act
         self.color_actions[self.brush_color].setChecked(True)
         bb.addSeparator()
-        bb.addWidget(QLabel("Pen"))
+        self.icon_labels.append(IconLabel("Pen", "adw:document-edit", "Pen: how new marks look"))
+        bb.addWidget(self.icon_labels[-1])
         self.pen_combo = QComboBox()
         for key, label in PEN_STYLES:
             self.pen_combo.addItem(label, key)
@@ -5221,8 +5406,11 @@ class MainWindow(QMainWindow):
         self.pen_combo.currentIndexChanged.connect(lambda _i: self._apply_brush(style=self.pen_combo.currentData()))
         bb.addWidget(self.pen_combo)
         bb.addSeparator()
-        for text, name, tip in (("↶ Undo", "undo", "Undo  (Ctrl+Z)"), ("↷ Redo", "redo", "Redo  (Ctrl+Shift+Z)")):
+        for text, name, tip in (("Undo", "undo", "Undo  (Ctrl+Z)"), ("Redo", "redo", "Redo  (Ctrl+Shift+Z)")):
             act = QAction(text, self)
+            ic = tool_icon(f"adw:edit-{name}")
+            if ic is not None:
+                act.setIcon(ic)
             act.setToolTip(tip)
             act.triggered.connect(lambda _c=False, n=name: self._canvas_call(n))
             bb.addAction(act)
@@ -5242,7 +5430,10 @@ class MainWindow(QMainWindow):
                                          "Manual only: when you press Sync Data")
         self.sync_mode_combo.currentIndexChanged.connect(lambda _i: self.set_sync_mode(self.sync_mode_combo.currentData()))
         bb.addWidget(self.sync_mode_combo)
-        self.sync_button = QPushButton("⟳  Sync Data")
+        self.sync_button = QPushButton("Sync Data")
+        _sync_ic = tool_icon("adw:view-refresh")
+        if _sync_ic is not None:
+            self.sync_button.setIcon(_sync_ic.pixmap(QSize(18, 18), QIcon.Normal, QIcon.On))  # black on orange
         self.sync_button.setObjectName("syncButton")
         self.sync_button.setToolTip("Sync marks, ratings, tags and metadata to the sidecars RapidRAW and other\n"
                                     "workflow apps read, for every frame in every open roll  (Ctrl+S)")
@@ -5403,6 +5594,13 @@ class MainWindow(QMainWindow):
         for page in self.pages():
             page.canvas.set_filter(key)
         self.mark_dirty()
+
+    def _set_ink_saver(self, on: bool) -> None:
+        if bool(self.cfg.setting("print_ink_saver")) != on:
+            self.cfg.set_setting("print_ink_saver", on)
+            self.cfg.save()
+            self.statusBar().showMessage("Printing on white (saves ink)" if on else
+                                         "Printing with the black film base", 4000)
 
     def set_exposure_tool(self, key: str, on: bool) -> None:
         self.cfg.set_setting(key, on)
@@ -5768,6 +5966,9 @@ class MainWindow(QMainWindow):
         self.sync_worker.xmp_sync = bool(c.setting("xmp_sync"))
         self.set_sync_mode(str(c.setting("sync_mode")))
         NUMBERING.update(style=str(c.setting("number_style")), start=int(c.setting("number_start")))
+        self.ink_action.blockSignals(True)
+        self.ink_action.setChecked(bool(c.setting("print_ink_saver")))
+        self.ink_action.blockSignals(False)
         STAR_RATINGS.clear()
         STAR_RATINGS.update(DEFAULT_STAR_RATINGS)
         STAR_RATINGS.update({str(k).upper(): int(v) for k, v in (c.setting("star_ratings") or {}).items()})
@@ -5790,6 +5991,12 @@ class MainWindow(QMainWindow):
             self.tool_bar.show()
             self.brush_bar.show()
             self._tb_area = area
+        style = {"icons": Qt.ToolButtonIconOnly, "both": Qt.ToolButtonTextBesideIcon,
+                 "text": Qt.ToolButtonTextOnly}.get(str(self.cfg.setting("toolbar_style")), Qt.ToolButtonIconOnly)
+        for bar in (self.tool_bar, self.brush_bar):
+            bar.setToolButtonStyle(style)
+        for lbl in self.icon_labels:
+            lbl.set_icon_mode(style != Qt.ToolButtonTextOnly)
         compact = self.cfg.setting("menu_mode") == "compact"
         self.menuBar().setVisible(not compact)
         self.menu_button_action.setVisible(compact)
