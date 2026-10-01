@@ -72,8 +72,8 @@ Image.MAX_IMAGE_PIXELS = None
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME = "ProofMark"
-APP_VERSION = "1.1.0"
-BUILD_NUMBER = 5
+APP_VERSION = "1.1.1"
+BUILD_NUMBER = 6
 BUILD_DATE = "2026-09-30"
 RELEASE_CHANNEL = "stable"
 APP_ID = "io.github.shammer03.ProofMark"  # reverse-DNS id used by Flatpak / AppStream; change to your own
@@ -83,6 +83,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Newest first. `release.py bump` inserts new entries at the marker.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
     # <changelog-insert>
+    ("1.1.1", "2026-09-30", [
+        'Print and PDF export: contact sheet is centred with correct margins',
+        "Images that can't be opened are labelled instead of showing loading… forever",
+        'Closing during loading or syncing no longer risks a crash or lost sidecars',
+        'Wayland: app ID registers correctly; Ctrl+C in a terminal closes cleanly',
+        'Number fields show their up / down arrows on the dark theme']),
     ("1.1.0", "2026-09-30", [
         "Crop box and ring are real boxes: drag one out, or click for a default, then drag its handles to resize",
         "New Adjust tool (E): select any mark, move it, resize it with handles, nudge with the arrow keys, Delete removes",
