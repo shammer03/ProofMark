@@ -56,7 +56,7 @@ from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, Q
                             QTimer, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontMetrics,
                            QIcon, QImage, QPainter, QPainterPath, QPen,
-                           QPixmap, QTransform)
+                           QPixmap, QPolygonF, QTransform)
 from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QComboBox,
                                QCompleter, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
@@ -1243,6 +1243,34 @@ def smooth_line(npts: list[list[float]], rect: QRectF) -> list[list[float]]:
         pts = out
     res = [_norm(rect, q.x(), q.y()) for q in pts]
     return res if len(res) >= 3 else res + [list(res[-1])] * (3 - len(res))
+
+
+def _dist_to_rect(pt: QPointF, r: QRectF) -> float:
+    dx = max(r.left() - pt.x(), 0.0, pt.x() - r.right())
+    dy = max(r.top() - pt.y(), 0.0, pt.y() - r.bottom())
+    return math.hypot(dx, dy)
+
+
+def hull_polygon(rects: list[QRectF]) -> QPolygonF:
+    """Convex hull around rectangles (here: a frame and its 60% view, plus the space between them)."""
+    pts = sorted({(round(q.x(), 2), round(q.y(), 2)) for r in rects
+                  for q in (r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft())})
+    if len(pts) < 3:
+        return QPolygonF([QPointF(x, y) for x, y in pts])
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lower: list = []
+    upper: list = []
+    for pt in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], pt) <= 0:
+            lower.pop()
+        lower.append(pt)
+    for pt in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], pt) <= 0:
+            upper.pop()
+        upper.append(pt)
+    return QPolygonF([QPointF(x, y) for x, y in lower[:-1] + upper[:-1]])
 
 
 def default_box_pts(rect: QRectF, n: list[float], scale: float) -> list[list[float]]:
@@ -3010,6 +3038,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self.order: list[int] = []        # frames shown, in sheet order (the filter decides)
         self._pos: dict[int, int] = {}    # frame index -> position on the sheet
         self._kbd_nav = False             # last frame choice came from the keyboard
+        self._toward_view = False         # cursor came from the hovered frame, may be heading to its view
         self._pix_cache: "OrderedDict[Path, QPixmap]" = OrderedDict()
 
         self.setFrameShape(QFrame.NoFrame)
@@ -3094,7 +3123,18 @@ class ContactSheetCanvas(QAbstractScrollArea):
         self._edit = {"idx": idx, "mark": mk, "mode": mode, "start": QPointF(pos), "moved": False,
                       "pts": [list(p) for p in mk.pts], "size": mk.size, "bounds": mark_bounds_px(mk, rect)}
 
+    def _hover_box(self) -> Optional[QRectF]:
+        """The 60% hover view's box while it is showing, else None."""
+        if (self.loupe_locked or self.compare or not self.loupe_enabled or self.hover_index < 0
+                or self._drag is not None or self._edit is not None):
+            return None
+        return self.loupe_geometry(self.hover_index, False)[0]
+
     def _update_cursor(self, pos: QPointF) -> None:
+        box = self._hover_box()
+        if box is not None and self._toward_view and box.contains(pos):  # the 60% view: click enlarges, wheel zooms
+            self.viewport().setCursor(Qt.PointingHandCursor)
+            return
         cur = Qt.ArrowCursor
         target = None if self.compare else self._target_at(pos)
         if target and self.tool != T_INSPECT:
@@ -3310,7 +3350,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 close = [o for o in options if o[0] >= 0.8 * biggest]
                 return min(close, key=lambda o: o[1])[2]
         # No room beside the frame (very large cells): use the half of the screen away from the cursor.
-        on_left = self.hover_pos.x() < vw / 2
+        on_left = cell.center().x() < vw / 2
         return QRectF(vw - max_w - 16 if on_left else 16, (vh - max_h) / 2, max_w, max_h)
 
     @staticmethod
@@ -3720,6 +3760,14 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 self.selected = i
                 self.viewport().update()
             return
+        box = self._hover_box()
+        if box is not None and self._toward_view and box.contains(pos):  # click on the 60% view: enlarge to 95%
+            self.loupe_locked = True
+            self.locked_index = self.selected = self.hover_index
+            self._click_locked = True
+            self._last_click_added = None
+            self.viewport().update()
+            return
         target = self._target_at(pos)
         if target is None:
             if self.loupe_locked:
@@ -3761,9 +3809,11 @@ class ContactSheetCanvas(QAbstractScrollArea):
             self._drag = {"idx": idx, "point": is_point, "start": QPointF(pos),
                           "mark": Mark(self.tool, pts, random.getrandbits(31), self.brush_size, self.brush_color,
                                        self.brush_style)}
-        else:  # inspect
+        else:  # Loupe mode: a click switches between the 60% hover view and the 95% enlarged view
             self._last_click_added = None
-            if not self.loupe_locked and self.loupe_enabled:
+            if self.loupe_locked:
+                self.loupe_locked = False
+            else:
                 self._lock_loupe(idx, pos)
                 self._click_locked = True
         self.viewport().update()
@@ -3779,6 +3829,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         pos = e.position()
         if (pos - self.hover_pos).manhattanLength() > 2:
             self._kbd_nav = False
+        prev = QPointF(self.hover_pos)
         self.hover_pos = QPointF(pos)
         if self._pan_last is not None and self.loupe_locked:
             _box, img = self.loupe_geometry(self.locked_index, True)
@@ -3822,11 +3873,26 @@ class ContactSheetCanvas(QAbstractScrollArea):
             else:
                 mark.pts[1] = n
         elif not self.loupe_locked:
-            i = self.cell_at(pos)
-            self.hover_index = i
-            if i >= 0:
-                n = norm_in_rect(self._image_rect(i), pos)
-                self.focus = QPointF(n[0], n[1])
+            box = self._hover_box()
+            cell = self._cell_rect(self.hover_index) if self.hover_index >= 0 else QRectF()
+            heading = box is not None and (box.contains(pos) or _dist_to_rect(pos, box) < _dist_to_rect(prev, box))
+            if (box is not None and self._toward_view and heading and not cell.contains(pos)
+                    and hull_polygon([cell, box]).containsPoint(pos, Qt.OddEvenFill)):
+                # Travelling from the frame to its 60% view (or resting on it): the view stays put,
+                # like a menu that doesn't close while you move into its submenu. On the view a click
+                # enlarges it, the wheel zooms, and when zoomed in, moving pans.
+                if box.contains(pos):
+                    self.focus = QPointF(min(1.0, max(0.0, (pos.x() - box.x()) / max(1.0, box.width()))),
+                                         min(1.0, max(0.0, (pos.y() - box.y()) / max(1.0, box.height()))))
+            else:
+                i = self.cell_at(pos)
+                if i != self.hover_index:
+                    self.zoom = 1.0  # a new frame starts unzoomed
+                self.hover_index = i
+                self._toward_view = i >= 0  # on a frame: you may now head for its view
+                if i >= 0:
+                    n = norm_in_rect(self._image_rect(i), pos)
+                    self.focus = QPointF(n[0], n[1])
         if self._drag is None and self._edit is None and self._pan_last is None:
             self._update_cursor(pos)
         self.viewport().update()
@@ -3880,22 +3946,33 @@ class ContactSheetCanvas(QAbstractScrollArea):
             if any(m is mk for m in self.frames[fi].marks):
                 self._retract_add(fi, mk)
             self._last_click_added = None
-        # Double-click never changes marks: it enlarges a frame, or returns from the enlarged view.
-        if self._click_locked:  # the first click just enlarged it (Loupe mode): keep it open
+        if self._click_locked or self.tool == T_INSPECT:
+            # The first click already switched the view (Loupe mode, or the 60% view): nothing more.
             self._click_locked = False
-        elif self.loupe_locked:
-            self.loupe_locked = False
-        elif idx >= 0:
-            self._lock_loupe(idx, pos)
+            self.viewport().update()
+            return
+        # Mark mode: take back this photo's newest mark; each further double-click takes the one before.
+        # Only marks on this photo, and never anything already deleted.
+        if 0 <= idx < len(self.frames) and self.frames[idx].marks:
+            self._remove_mark(idx, self.frames[idx].marks[-1])
+            left = len(self.frames[idx].marks)
+            self.status.emit(f"Frame {idx + 1}A: newest mark removed  ({left} left; Ctrl+Z brings it back)")
         self.viewport().update()
 
     def wheelEvent(self, e) -> None:  # noqa: N802
-        if e.modifiers() & Qt.ControlModifier:
+        pos = e.position()
+        over_view = False  # cursor on the 60% view or the 95% enlarged view: the wheel zooms
+        if not self.compare:
+            if self.loupe_locked:
+                over_view = self.loupe_geometry(self.locked_index, True)[0].contains(pos)
+            else:
+                box = self._hover_box()
+                over_view = box is not None and self._toward_view and box.contains(pos)
+        if over_view or e.modifiers() & Qt.ControlModifier:
             idx = self.locked_index if self.loupe_locked else self.hover_index
             if idx >= 0 and not self.compare:
-                pos = e.position()
                 rect = self._rect_for(idx)
-                if rect.contains(pos):
+                if self.loupe_locked and rect.contains(pos):
                     n = norm_in_rect(rect, pos)
                     self.focus = QPointF(n[0], n[1])
                 steps = e.angleDelta().y() / 120.0
@@ -4205,12 +4282,13 @@ KEYS_TEXT = (
     "Shift+X  Reject / un-reject     N  Frame note     Ctrl+] / Ctrl+[  Rotate     Space  Enlarge\n"
     "Star colours rate too: green 5, red 5, yellow 4, silver 3 (Settings ▸ Files & Sync)\n\n"
     "VIEWING\n"
-    "Hover  loupe beside the frame     Click (Inspect) / Right-click / Space  Enlarge to 95%\n"
+    "Hover  60% view beside the frame — move onto it to keep it: click = 95%, wheel = zoom\n"
+    "Loupe mode: click switches 60% / 95%     Right-click / Space  Enlarge     Esc  Back\n"
     "View  Full screen, or the sheet as it prints on 4×6, 5×7 or 8×10     Show  filter frames\n"
     "Ctrl+Wheel  Zoom 0.7×–4.5×     Right-drag  Pan     Ctrl+0  Reset zoom\n"
     "C  2-up compare (hover for [B]); C or Esc exits\n\n"
     "UNDO\nCtrl+Z  Undo     Ctrl+Shift+Z  Redo     Delete  Remove the selected mark\n"
-    "Double-click  Enlarge a frame / return from the enlarged view (never changes marks)\n\n"
+    "Mark mode: double-click a photo  Remove its newest mark (again for the one before)\n\n"
     "FILE\nCtrl+O Import   Ctrl+P Print   Ctrl+Shift+E PDF   Ctrl+Shift+S Export selects   Ctrl+S Sync Data\n"
     "Ctrl+, Settings   F11 Full screen")
 
@@ -4420,6 +4498,12 @@ class MainWindow(QMainWindow):
         self.pen_combo.setToolTip("How new marks look: wax pencil, china marker, felt marker or a clean line")
         self.pen_combo.currentIndexChanged.connect(lambda _i: self._apply_brush(style=self.pen_combo.currentData()))
         bb.addWidget(self.pen_combo)
+        bb.addSeparator()
+        for text, name, tip in (("↶ Undo", "undo", "Undo  (Ctrl+Z)"), ("↷ Redo", "redo", "Redo  (Ctrl+Shift+Z)")):
+            act = QAction(text, self)
+            act.setToolTip(tip)
+            act.triggered.connect(lambda _c=False, n=name: self._canvas_call(n))
+            bb.addAction(act)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         spacer.setStyleSheet("background: transparent;")
