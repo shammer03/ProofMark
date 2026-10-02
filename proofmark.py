@@ -1079,6 +1079,27 @@ def _wobbled(pts: list[QPointF], amp: float, wavelength: float, seed: int) -> li
     return out
 
 
+def _pressure_stroke(lp: QPainter, pen: QPen, dense: list[QPointF], w: float, seed: int) -> None:
+    """A stroke laid down by hand: it starts and lifts off thinner, and the pressure drifts along the way."""
+    rng = random.Random(seed)
+    ph1, ph2 = rng.uniform(0, math.tau), rng.uniform(0, math.tau)
+    total = sum(math.hypot(b.x() - a.x(), b.y() - a.y()) for a, b in zip(dense, dense[1:]))
+    taper = min(w * 2.2, total / 3)
+    lift = rng.uniform(0.45, 0.65)  # how thin the pencil lifts off
+    s = 0.0
+    for a, b in zip(dense, dense[1:]):
+        seg = math.hypot(b.x() - a.x(), b.y() - a.y())
+        mid = s + seg / 2
+        f = 1.0 + 0.12 * math.sin(mid / (w * 7) + ph1) + 0.06 * math.sin(mid / (w * 2.3) + ph2)
+        if taper > 0:
+            f *= min(1.0, 0.5 + 0.5 * mid / taper)                       # landing
+            f *= min(1.0, lift + (1 - lift) * (total - mid) / taper)      # lifting off
+        pen.setWidthF(max(0.6, w * f))
+        lp.setPen(pen)
+        lp.drawLine(a, b)
+        s += seg
+
+
 def _paint_pen_layer(lp: QPainter, polys: list[list[QPointF]], width: float, color: QColor,
                      style: str, seed: int) -> None:
     """Draw one mark's strokes at full strength, then wipe paper-grain streaks out of them."""
@@ -1097,11 +1118,13 @@ def _paint_pen_layer(lp: QPainter, polys: list[list[QPointF]], width: float, col
         lp.setBrush(Qt.NoBrush)
         if len(dense) == 1:
             lp.drawPoint(dense[0])
-        else:
+        elif wobble <= 0:
             path = QPainterPath(dense[0])
             for q in dense[1:]:
                 path.lineTo(q)
             lp.drawPath(path)
+        else:
+            _pressure_stroke(lp, pen, dense, w, seed + k * 17)
     if streak_p <= 0:
         return
     # Grain: short streaks running along the stroke, where the wax skipped over the paper's tooth.
@@ -1181,10 +1204,38 @@ def render_pen_strokes(painter: QPainter, polys: list[list[QPointF]], width: flo
     painter.restore()
 
 
+def _hand_line(a: QPointF, b: QPointF, rng: random.Random, wander: float,
+               over: tuple[float, float] = (0.0, 0.0)) -> list[QPointF]:
+    """
+    A straight line as a hand draws it: ends a little off target, a slight bow, and `over`
+    (share of the length) running past the start and end.
+    `wander` is how far, in pixels, the hand strays.
+    """
+    dx, dy = b.x() - a.x(), b.y() - a.y()
+    ln = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / ln, dy / ln
+    nx, ny = -uy, ux
+    s0, s1 = -over[0] * ln, ln * (1 + over[1])
+    j0, j1 = rng.uniform(-1, 1) * wander, rng.uniform(-1, 1) * wander
+    bow = rng.uniform(-1, 1) * min(wander * 1.5, ln * 0.03)
+    pts = []
+    for i in range(13):
+        u = i / 12
+        d = s0 + (s1 - s0) * u
+        off = j0 + (j1 - j0) * u + bow * 4 * u * (1 - u)
+        pts.append(QPointF(a.x() + ux * d + nx * off, a.y() + uy * d + ny * off))
+    return pts
+
+
 def mark_polylines(mark: Mark, rect: QRectF) -> list[list[QPointF]]:
-    """Expand a mark into stroke polylines in pixel space of `rect`."""
+    """
+    Expand a mark into stroke polylines in pixel space of `rect`. Shapes come out a little
+    uneven, the way a hand draws them; the mark's seed keeps each one the same every time.
+    """
     def P(pt: list[float]) -> QPointF:
         return QPointF(rect.x() + pt[0] * rect.width(), rect.y() + pt[1] * rect.height())
+
+    rng = random.Random(mark.seed * 7 + 3)
 
     k = mark.kind
     if not mark.pts:
@@ -1200,9 +1251,15 @@ def mark_polylines(mark: Mark, rect: QRectF) -> list[list[QPointF]]:
             return []
         ang = math.atan2(b.y() - a.y(), b.x() - a.x())
         head = (min(length * 0.35, rect.width() * 0.07) + 2.0) * 1.6 * max(0.05, mark.size) ** 0.35
-        h1 = QPointF(b.x() - head * math.cos(ang - 0.5), b.y() - head * math.sin(ang - 0.5))
-        h2 = QPointF(b.x() - head * math.cos(ang + 0.5), b.y() - head * math.sin(ang + 0.5))
-        return [[a, b], [h1, b, h2]]
+        pen = rect.width() * MARK_WIDTH * stroke_scale(mark.size, T_ARROW)
+        head = max(head, min(length * 0.6, pen * 3.2))  # the head stays clear of a thick shaft
+        wander = min(length * 0.02, head * 0.15)
+        h1 = QPointF(b.x() - head * math.cos(ang - 0.5 + rng.uniform(-.1, .1)),
+                     b.y() - head * math.sin(ang - 0.5 + rng.uniform(-.1, .1)))
+        h2 = QPointF(b.x() - head * rng.uniform(.85, 1.1) * math.cos(ang + 0.5),
+                     b.y() - head * rng.uniform(.85, 1.1) * math.sin(ang + 0.5))
+        tip = QPointF(b.x() + rng.uniform(-1, 1) * wander, b.y() + rng.uniform(-1, 1) * wander)
+        return [_hand_line(a, b, rng, wander), [h1, tip, h2]]
     if k == T_RING:
         if len(mark.pts) < 2:
             return []
@@ -1211,37 +1268,58 @@ def mark_polylines(mark: Mark, rect: QRectF) -> list[list[QPointF]]:
         rx, ry = abs(b.x() - a.x()) / 2, abs(b.y() - a.y()) / 2
         if rx < 1.0 and ry < 1.0:
             return []
-        steps = 72
+        # A loose oval: slightly tilted, lumpy, and carried on past where it started so the
+        # two ends overlap side by side instead of meeting.
+        steps = 96
+        start = rng.uniform(0, math.tau)
+        sweep = math.tau * rng.uniform(1.10, 1.22)
+        tilt = rng.uniform(-0.07, 0.07)
+        drift = rng.uniform(0.03, 0.06) * rng.choice((-1, 1))
+        lumps = [(rng.uniform(0, math.tau), rng.uniform(0.015, 0.035), k) for k in (2, 3)]
+        ct, st = math.cos(tilt), math.sin(tilt)
         poly: list[QPointF] = []
-        for s in range(int(steps * 1.08) + 1):  # slight overlap: hand-closed loop
-            t = math.tau * s / steps + 0.6
+        for s in range(int(steps * sweep / math.tau) + 1):
+            t = start + math.tau * s / steps
+            g = 1 + drift * (t - start) / math.tau + sum(a * math.sin(k * t + ph) for ph, a, k in lumps)
             c, sn = math.cos(t), math.sin(t)
-            poly.append(QPointF(cx + rx * math.copysign(abs(c) ** 0.5, c),
-                                cy + ry * math.copysign(abs(sn) ** 0.5, sn)))  # superellipse n=4
+            x = rx * g * math.copysign(abs(c) ** 0.8, c)  # a touch squarer than an ellipse
+            y = ry * g * math.copysign(abs(sn) ** 0.8, sn)
+            poly.append(QPointF(cx + x * ct - y * st, cy + x * st + y * ct))
         return [poly]
     if k == T_CROP and len(mark.pts) >= 2:
         box = QRectF(P(mark.pts[0]), P(mark.pts[1])).normalized()
-        ext = max(4.0, 0.12 * min(box.width(), box.height()))  # crop-mark overshoot
-        return [[QPointF(box.left() - ext, box.top()), QPointF(box.right() + ext, box.top())],
-                [QPointF(box.left() - ext, box.bottom()), QPointF(box.right() + ext, box.bottom())],
-                [QPointF(box.left(), box.top() - ext), QPointF(box.left(), box.bottom() + ext)],
-                [QPointF(box.right(), box.top() - ext), QPointF(box.right(), box.bottom() + ext)]]
+        small = max(1.0, min(box.width(), box.height()))
+        wander = small * 0.012
+
+        def side(a: QPointF, b: QPointF) -> list[QPointF]:  # each side its own stroke, past the corners
+            ln = max(1.0, math.hypot(b.x() - a.x(), b.y() - a.y()))
+            over = max(4.0, 0.12 * small) / ln
+            return _hand_line(a, b, rng, wander, (over * rng.uniform(0.3, 1.4), over * rng.uniform(0.3, 1.4)))
+        tl, tr, br, bl = box.topLeft(), box.topRight(), box.bottomRight(), box.bottomLeft()
+        return [side(tl, tr), side(tr, br), side(br, bl), side(bl, tl)]
     c = P(mark.pts[0])
     r = 0.075 * min(rect.width(), rect.height()) * glyph_scale(mark.size)
+    def J(x: float, y: float, amount: float = 0.07) -> QPointF:  # a point the hand lands near
+        return QPointF(x + rng.uniform(-1, 1) * r * amount, y + rng.uniform(-1, 1) * r * amount)
+
     if k == T_STAR:
         rr = r * 1.15
-        return [[QPointF(c.x() + rr * math.cos(-math.pi / 2 + 4 * math.pi / 5 * i),
-                         c.y() + rr * math.sin(-math.pi / 2 + 4 * math.pi / 5 * i)) for i in range(6)]]
+        spin = rng.uniform(-0.08, 0.08)
+        pts = [J(c.x() + rr * math.cos(-math.pi / 2 + spin + 4 * math.pi / 5 * i),
+                 c.y() + rr * math.sin(-math.pi / 2 + spin + 4 * math.pi / 5 * i)) for i in range(5)]
+        end = QPointF(pts[0].x() + (pts[1].x() - pts[0].x()) * 0.12, pts[0].y() + (pts[1].y() - pts[0].y()) * 0.12)
+        return [pts + [J(pts[0].x(), pts[0].y(), 0.05), end]]  # closes past the first point
     if k == T_REJECT:
-        box = [QPointF(c.x() - r, c.y() - r), QPointF(c.x() + r, c.y() - r),
-               QPointF(c.x() + r, c.y() + r), QPointF(c.x() - r, c.y() + r), QPointF(c.x() - r, c.y() - r)]
-        return [box, [QPointF(c.x() - r, c.y() - r), QPointF(c.x() + r, c.y() + r)],
-                [QPointF(c.x() + r, c.y() - r), QPointF(c.x() - r, c.y() + r)]]
+        w = r * 0.04
+        a, b2, d, e = QPointF(c.x() - r, c.y() - r), QPointF(c.x() + r, c.y() - r), \
+            QPointF(c.x() + r, c.y() + r), QPointF(c.x() - r, c.y() + r)
+        box = [_hand_line(p0, p1, rng, w, (0.04, 0.08)) for p0, p1 in ((a, b2), (b2, d), (d, e), (e, a))]
+        return box + [_hand_line(a, d, rng, w, (0.06, 0.1)), _hand_line(b2, e, rng, w, (0.06, 0.1))]
     if k == T_PUSH:
-        return [[QPointF(c.x() - r, c.y()), QPointF(c.x() + r, c.y())],
-                [QPointF(c.x(), c.y() - r), QPointF(c.x(), c.y() + r)]]
+        return [_hand_line(QPointF(c.x() - r, c.y()), QPointF(c.x() + r, c.y()), rng, r * 0.05),
+                _hand_line(QPointF(c.x(), c.y() - r), QPointF(c.x(), c.y() + r), rng, r * 0.05)]
     if k == T_PULL:
-        return [[QPointF(c.x() - r, c.y()), QPointF(c.x() + r, c.y())]]
+        return [_hand_line(QPointF(c.x() - r, c.y()), QPointF(c.x() + r, c.y()), rng, r * 0.05)]
     if k == T_CROP:
         g, e = r * 0.45, r * 1.15
         return [[QPointF(c.x() - g, c.y() - e), QPointF(c.x() - g, c.y() + e)],
@@ -1450,7 +1528,8 @@ def snap_detent(old: float, new: float, detents: list[float]) -> float:
     return new
 
 GLYPH_K, GLYPH_EXP = 1.0, 0.7                       # star / X / + / - size
-STROKE = {"line": (3.6, 0.7), "symbol": (1.8, 0.4)}  # pen thickness: lines & arrows, everything else
+STROKE = {"line": (4.0, 0.8), "box": (3.0, 0.6), "glyph": (1.8, 0.4)}  # pen thickness by kind of mark
+MARK_WIDTH = 0.011  # base pen width as a share of the photo width (sheet, loupe and print alike)
 
 
 def glyph_scale(size: float) -> float:
@@ -1463,8 +1542,9 @@ def size_for_glyph(scale: float) -> float:
 
 
 def stroke_scale(size: float, kind: str = T_LINE) -> float:
-    """Pen thickness for a brush size; lines and arrows grow faster than symbols, crop boxes and rings."""
-    k, e = STROKE["line" if kind in (T_LINE, T_ARROW) else "symbol"]
+    """Pen thickness for a brush size: lines and arrows grow fastest, then crop boxes and rings;
+    stars, X, + and - keep a pen in proportion to the symbol so it never fills in."""
+    k, e = STROKE["line" if kind in (T_LINE, T_ARROW) else "box" if kind in (T_CROP, T_RING) else "glyph"]
     return k * max(0.05, size) ** e
 
 
@@ -3425,7 +3505,7 @@ def paint_frame_clean(p: QPainter, cell: QRectF, rebate_h: float, number: str, m
             img = fit_rect(slot, aspect)
         p.drawPixmap(img, pm, QRectF(pm.rect()))
         if marked is not None:
-            width = max(1.5, img.width() * 0.011)
+            width = max(1.5, img.width() * MARK_WIDTH)
             for mk in marked.marks:
                 draw_mark(p, mk, img, width)
         if turn:
@@ -4619,7 +4699,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         else:
             p.setPen(QColor("#555555"))
             p.drawText(slot, Qt.AlignCenter, "can't open" if fr.error else "loading…")
-        width = max(1.5, img.width() * 0.011)
+        width = max(1.5, img.width() * MARK_WIDTH)
         for mk in self._marks_with_drag(i):
             draw_mark(p, mk, img, width)
         self._paint_selection(p, i, img)
@@ -4661,7 +4741,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         else:
             p.setPen(QColor("#666666"))
             p.drawText(box, Qt.AlignCenter, f"Can't open this file\n{fr.error}" if fr.error else "loading…")
-        width = max(1.8, img.width() * 0.008)
+        width = max(1.8, img.width() * MARK_WIDTH)
         for mk in self._marks_with_drag(idx):
             draw_mark(p, mk, img, width)
         self._paint_selection(p, idx, img)
@@ -4703,7 +4783,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 if pm is not None:
                     p.drawPixmap(img, pm, QRectF(pm.rect()))
                 for mk in fr.marks:
-                    draw_mark(p, mk, img, max(1.8, img.width() * 0.008))
+                    draw_mark(p, mk, img, max(1.8, img.width() * MARK_WIDTH))
                 label = f"[{tag}]  {self.roll.label(idx)}  {fr.name}"
             else:
                 p.setPen(QColor("#777777"))

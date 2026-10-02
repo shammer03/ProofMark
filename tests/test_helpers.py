@@ -43,6 +43,22 @@ class Basics(unittest.TestCase):
         self.assertEqual(pm.snap_detent(0.80, 0.85, pm.ZOOM_DETENTS), 0.85)  # no stop in between
 
 
+class Marks(unittest.TestCase):
+    def test_hand_drawn_shape_is_the_same_every_redraw(self) -> None:
+        from PySide6.QtCore import QRectF
+        rect = QRectF(0, 0, 400, 300)
+        for kind, pts in ((pm.T_RING, [[.2, .2], [.8, .8]]), (pm.T_CROP, [[.1, .1], [.9, .9]]), (pm.T_STAR, [[.5, .5]])):
+            a = pm.mark_polylines(pm.Mark(kind, pts, 42), rect)
+            b = pm.mark_polylines(pm.Mark(kind, pts, 42), rect)
+            c = pm.mark_polylines(pm.Mark(kind, pts, 43), rect)
+            self.assertEqual([[(q.x(), q.y()) for q in poly] for poly in a], [[(q.x(), q.y()) for q in poly] for poly in b])
+            self.assertNotEqual([[(q.x(), q.y()) for q in poly] for poly in a], [[(q.x(), q.y()) for q in poly] for poly in c])
+
+    def test_symbols_never_fill_in(self) -> None:
+        self.assertLess(pm.stroke_scale(2.5, pm.T_STAR), pm.stroke_scale(2.5, pm.T_RING))
+        self.assertLess(pm.stroke_scale(2.5, pm.T_RING), pm.stroke_scale(2.5, pm.T_LINE))
+
+
 class Decoding(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
