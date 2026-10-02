@@ -171,13 +171,18 @@ class Marking(AppTest):
         b = pm.mark_bounds_px(self.c.frames[self.i].marks[-1], rect)
         self.assertGreater(b.height(), rect.height() * 0.9)
 
-    def test_marks_may_run_onto_the_film_but_not_far(self) -> None:
+    def test_marks_reach_the_whole_frame_and_a_little_beyond(self) -> None:
+        tall = self.frame("img_03.jpg")  # portrait: narrow photo in a wide frame
         self.d.win.set_tool(pm.T_RING)
-        rect = self.c._image_rect(self.i)
-        self.d.drag(self.d.point(self.i, .5, .5), (rect.bottomRight() + pm.QPointF(200, 200)).toPoint())
-        corner = self.c.frames[self.i].marks[-1].pts[1]
-        self.assertAlmostEqual(corner[0], 1 + pm.MARK_SPILL)
-        self.assertAlmostEqual(corner[1], 1 + pm.MARK_SPILL)
+        cell, img = self.c._cell_rect(tall), self.c._image_rect(tall)
+        self.d.drag(cell.topLeft().toPoint() + QPoint(3, 3), (cell.bottomRight() + pm.QPointF(300, 300)).toPoint())
+        mk = self.c.frames[tall].marks[-1]
+        drawn = pm.mark_bounds_px(mk, img)
+        reach = pm.mark_reach(cell)
+        self.assertLess(drawn.left(), img.left() - img.width() * 0.3)       # out over the film beside the photo
+        self.assertAlmostEqual(drawn.right(), reach.right(), delta=1)        # a little onto the next frame...
+        self.assertAlmostEqual(drawn.bottom(), reach.bottom(), delta=1)
+        self.assertLess(reach.right() - cell.right(), cell.width() * 0.06)   # ...and no further
 
     def test_rotate_turns_marks_with_the_photo(self) -> None:
         self.d.win.set_tool(pm.T_STAR)

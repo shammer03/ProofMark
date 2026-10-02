@@ -1022,19 +1022,36 @@ def fit_rect(box: QRectF, aspect: float) -> QRectF:
     return QRectF(box.center().x() - w / 2, box.center().y() - h / 2, w, h)
 
 
-MARK_SPILL = 0.06  # marks may run this far past the photo (share of its size), onto the film around it
+# Like grease on a real contact sheet, marks may cover the whole frame (the film around the photo and
+# the edge numbers) and run a little onto the neighbouring frames: this share of the frame's size.
+MARK_OVERLAP = 0.05
+Limits = tuple[float, float, float, float]  # left, top, right, bottom in photo units (0-1 = the photo)
+FREE: Limits = (-2.0, -2.0, 3.0, 3.0)
 
 
-def spill_rect(img: QRectF) -> QRectF:
-    """Where a frame's marks may reach: the photo plus a little of the film around it."""
-    return img.adjusted(-img.width() * MARK_SPILL, -img.height() * MARK_SPILL,
-                        img.width() * MARK_SPILL, img.height() * MARK_SPILL)
+def mark_reach(cell: QRectF) -> QRectF:
+    """Where a frame's marks may be seen: its whole cell plus a little of the frames around it."""
+    m = MARK_OVERLAP * min(cell.width(), cell.height())
+    return cell.adjusted(-m, -m, m, m)
 
 
-def norm_in_rect(rect: QRectF, pos: QPointF, spill: float = 0.0) -> list[float]:
+def reach_limits(img: QRectF, cell: QRectF) -> Limits:
+    """mark_reach() in the photo's own 0-1 units, so a mark can be kept inside it."""
+    r = mark_reach(cell)
+    w, h = max(1e-6, img.width()), max(1e-6, img.height())
+    return ((r.left() - img.x()) / w, (r.top() - img.y()) / h, (r.right() - img.x()) / w, (r.bottom() - img.y()) / h)
+
+
+def norm_in_rect(rect: QRectF, pos: QPointF, limits: Optional[Limits] = None) -> list[float]:
+    lx, ly, hx, hy = limits or (0.0, 0.0, 1.0, 1.0)
     x = (pos.x() - rect.x()) / max(1e-6, rect.width())
     y = (pos.y() - rect.y()) / max(1e-6, rect.height())
-    return [min(1.0 + spill, max(-spill, x)), min(1.0 + spill, max(-spill, y))]
+    return [min(hx, max(lx, x)), min(hy, max(ly, y))]
+
+
+def clamp_mark(mark: Mark, limits: Limits) -> None:
+    lx, ly, hx, hy = limits
+    mark.pts = [[min(hx, max(lx, x)), min(hy, max(ly, y))] for x, y in mark.pts]
 
 
 # ── Textured wax grease pencil shader ───────────────────────────────────────
@@ -1364,7 +1381,7 @@ def _px(rect: QRectF, pt: list[float]) -> QPointF:
 
 
 def _norm(rect: QRectF, x: float, y: float) -> list[float]:
-    return norm_in_rect(rect, QPointF(x, y), MARK_SPILL)
+    return norm_in_rect(rect, QPointF(x, y), FREE)  # the canvas keeps marks within reach
 
 
 def mark_bounds_px(mark: Mark, rect: QRectF) -> QRectF:
@@ -1470,11 +1487,11 @@ def smooth_line(npts: list[list[float]], rect: QRectF) -> list[list[float]]:
     return res if len(res) >= 3 else res + [list(res[-1])] * (3 - len(res))
 
 
-def move_mark(mark: Mark, pts0: list[list[float]], dx: float, dy: float) -> None:
+def move_mark(mark: Mark, pts0: list[list[float]], dx: float, dy: float, limits: Limits = FREE) -> None:
     xs, ys = [p[0] for p in pts0], [p[1] for p in pts0]
-    lo, hi = -MARK_SPILL, 1.0 + MARK_SPILL
-    dx = max(lo - min(xs), min(hi - max(xs), dx))
-    dy = max(lo - min(ys), min(hi - max(ys), dy))
+    lx, ly, hx, hy = limits
+    dx = max(lx - min(xs), min(hx - max(xs), dx))
+    dy = max(ly - min(ys), min(hy - max(ys), dy))
     mark.pts = [[p[0] + dx, p[1] + dy] for p in pts0]
 
 
@@ -3535,16 +3552,25 @@ def paint_frame_marks(p: QPainter, cell: QRectF, rebate_h: float, pm: Optional[Q
     slot = frame_slot_rect(cell, rebate_h)
     aspect = pm.width() / pm.height()
     p.save()
+    p.setClipRect(mark_reach(cell), Qt.IntersectClip)
+    marks = fr.marks
     if sideways and aspect < 1.0:
         outer = fit_rect(slot, 1.0 / aspect)
-        p.translate(outer.center())
-        p.rotate(-90)
+        turn = QTransform().translate(outer.center().x(), outer.center().y()).rotate(-90)
+        p.setTransform(turn, True)
         img = QRectF(-outer.height() / 2, -outer.width() / 2, outer.height(), outer.width())
+        # The film beside an upright photo isn't beside it once it lies on its side, so marks drawn
+        # out there are kept within this frame instead of turning out past it.
+        limits = reach_limits(img, turn.inverted()[0].mapRect(cell))
+        marks = []
+        for mk in fr.marks:
+            kept = Mark(mk.kind, [list(q) for q in mk.pts], mk.seed, mk.size, mk.color, mk.style)
+            clamp_mark(kept, limits)
+            marks.append(kept)
     else:
         img = fit_rect(slot, aspect)
-    p.setClipRect(spill_rect(img), Qt.IntersectClip)
     width = max(1.5, img.width() * MARK_WIDTH)
-    for mk in fr.marks:
+    for mk in marks:
         draw_mark(p, mk, img, width)
     p.restore()
 
@@ -4406,6 +4432,10 @@ class ContactSheetCanvas(QAbstractScrollArea):
             return (lo + hi) / 2
         return max(hi - size / 2, min(lo + size / 2, c))
 
+    def _mark_limits(self, idx: int) -> Limits:
+        """How far marks on this frame may reach, in photo units (the same on the sheet and in the loupe)."""
+        return reach_limits(self._image_rect(idx), self._cell_rect(idx))
+
     def _rect_for(self, idx: int) -> QRectF:
         if self.loupe_locked and idx == self.locked_index:
             return self.loupe_geometry(idx, True)[1]
@@ -4730,7 +4760,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
         if not marks and not (self.sel is not None and self.sel[0] == i):
             return
         p.save()
-        p.setClipRect(spill_rect(img), Qt.IntersectClip)
+        p.setClipRect(mark_reach(self._cell_rect(i)), Qt.IntersectClip)
         width = max(1.5, img.width() * MARK_WIDTH)
         for mk in marks:
             draw_mark(p, mk, img, width)
@@ -4978,9 +5008,10 @@ class ContactSheetCanvas(QAbstractScrollArea):
             rect = self._rect_for(ed["idx"])
             if ed["mode"] == "move":
                 move_mark(mk, ed["pts"], (pos.x() - ed["start"].x()) / max(1e-6, rect.width()),
-                          (pos.y() - ed["start"].y()) / max(1e-6, rect.height()))
+                          (pos.y() - ed["start"].y()) / max(1e-6, rect.height()), self._mark_limits(ed["idx"]))
             else:
                 resize_mark(mk, rect, ed["mode"], pos, ed)
+                clamp_mark(mk, self._mark_limits(ed["idx"]))
             ed["moved"] = True
         elif self._press is not None:
             start = self._press["pos"]
@@ -4996,7 +5027,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
                     return
                 rect = self._rect_for(idx)
                 is_point = self.tool in POINT_TOOLS
-                n0 = norm_in_rect(rect, start, MARK_SPILL)
+                n0 = norm_in_rect(rect, start, self._mark_limits(idx))
                 pts = [n0] if (is_point or self.tool == T_LINE) else [n0, list(n0)]
                 self._drag = {"idx": idx, "point": is_point, "start": QPointF(start),
                               "mark": Mark(self.tool, pts, random.getrandbits(31), self.brush_size,
@@ -5005,13 +5036,13 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 return
         elif self._drag is not None:
             rect = self._rect_for(self._drag["idx"])
-            n = norm_in_rect(rect, pos, MARK_SPILL)
+            n = norm_in_rect(rect, pos, self._mark_limits(self._drag["idx"]))
             mark: Mark = self._drag["mark"]
             if self._drag["point"]:
                 # Like the ring: the press point is one corner, the cursor the opposite one.
                 start = self._drag["start"]
                 if not fit_point_mark(mark, rect, start, pos):
-                    mark.pts = [norm_in_rect(rect, start, MARK_SPILL)]
+                    mark.pts = [norm_in_rect(rect, start, self._mark_limits(self._drag["idx"]))]
                     mark.size = self.brush_size
             elif mark.kind == T_LINE:
                 # Stabiliser ("lazy brush"): the pen trails the cursor on a short string, so hand shake
@@ -5025,7 +5056,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
                     self._drag["pen"] = pen
                     last = _px(rect, mark.pts[-1])
                     if math.hypot(pen.x() - last.x(), pen.y() - last.y()) > 1.5:
-                        mark.pts.append(norm_in_rect(rect, pen, MARK_SPILL))
+                        mark.pts.append(norm_in_rect(rect, pen, self._mark_limits(self._drag["idx"])))
             else:
                 mark.pts[1] = n
         elif not self.loupe_locked:
