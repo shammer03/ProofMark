@@ -133,6 +133,52 @@ class Marking(AppTest):
         self.c.redo()
         self.assertEqual(len(self.c.frames[self.i].marks), 1)
 
+    def test_just_drawn_mark_can_be_dragged_to_a_new_spot(self) -> None:
+        for tool in (pm.T_STAR, pm.T_REJECT, pm.T_RING, pm.T_CROP):
+            self.c.frames[self.i].marks.clear()
+            self.d.win.set_tool(tool)
+            self.d.drag(self.d.point(self.i, .3, .3), self.d.point(self.i, .5, .5))
+            mk = self.c.frames[self.i].marks[-1]
+            self.assertIs(self.c.sel[1], mk, tool)
+            rect = self.c._image_rect(self.i)
+            if pm.is_point_mark(mk):
+                grab = pm.mark_bounds_px(mk, rect).center().toPoint()
+            else:  # a spot on the stroke well away from the resize handles
+                handles = list(pm.handle_points(mk, rect).values())
+                on = [q for poly in pm.mark_polylines(mk, rect) for q in poly if rect.contains(q)]
+                grab = max(on, key=lambda q: min((q - h).manhattanLength() for h in handles)).toPoint()
+            before = [list(p) for p in mk.pts]
+            self.d.drag(grab, grab + QPoint(25, 10))
+            self.assertEqual(len(self.c.frames[self.i].marks), 1, f"{tool}: drew a second mark instead")
+            self.assertGreater(mk.pts[0][0], before[0][0], f"{tool}: didn't move")
+            self.c.undo()
+            self.assertEqual(mk.pts, before)
+
+    def test_click_on_the_selected_mark_still_zooms(self) -> None:
+        self.d.win.set_tool(pm.T_STAR)
+        self.d.drag(self.d.point(self.i, .3, .3), self.d.point(self.i, .5, .5))
+        mk = self.c.frames[self.i].marks[-1]
+        before = [list(p) for p in mk.pts]
+        self.d.click(pm.mark_bounds_px(mk, self.c._image_rect(self.i)).center().toPoint())
+        pump(QApplication.doubleClickInterval() + 150)
+        self.assertTrue(self.c.loupe_locked)
+        self.assertEqual(mk.pts, before)
+
+    def test_star_can_be_dragged_out_over_the_whole_frame(self) -> None:
+        self.d.win.set_tool(pm.T_STAR)
+        self.d.drag(self.d.point(self.i, .02, .02), self.d.point(self.i, .98, .98))
+        rect = self.c._image_rect(self.i)
+        b = pm.mark_bounds_px(self.c.frames[self.i].marks[-1], rect)
+        self.assertGreater(b.height(), rect.height() * 0.9)
+
+    def test_marks_may_run_onto_the_film_but_not_far(self) -> None:
+        self.d.win.set_tool(pm.T_RING)
+        rect = self.c._image_rect(self.i)
+        self.d.drag(self.d.point(self.i, .5, .5), (rect.bottomRight() + pm.QPointF(200, 200)).toPoint())
+        corner = self.c.frames[self.i].marks[-1].pts[1]
+        self.assertAlmostEqual(corner[0], 1 + pm.MARK_SPILL)
+        self.assertAlmostEqual(corner[1], 1 + pm.MARK_SPILL)
+
     def test_rotate_turns_marks_with_the_photo(self) -> None:
         self.d.win.set_tool(pm.T_STAR)
         self.d.drag(self.d.point(self.i, .1, .1), self.d.point(self.i, .2, .2))

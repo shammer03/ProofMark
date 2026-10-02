@@ -1022,10 +1022,19 @@ def fit_rect(box: QRectF, aspect: float) -> QRectF:
     return QRectF(box.center().x() - w / 2, box.center().y() - h / 2, w, h)
 
 
-def norm_in_rect(rect: QRectF, pos: QPointF) -> list[float]:
+MARK_SPILL = 0.06  # marks may run this far past the photo (share of its size), onto the film around it
+
+
+def spill_rect(img: QRectF) -> QRectF:
+    """Where a frame's marks may reach: the photo plus a little of the film around it."""
+    return img.adjusted(-img.width() * MARK_SPILL, -img.height() * MARK_SPILL,
+                        img.width() * MARK_SPILL, img.height() * MARK_SPILL)
+
+
+def norm_in_rect(rect: QRectF, pos: QPointF, spill: float = 0.0) -> list[float]:
     x = (pos.x() - rect.x()) / max(1e-6, rect.width())
     y = (pos.y() - rect.y()) / max(1e-6, rect.height())
-    return [min(1.0, max(0.0, x)), min(1.0, max(0.0, y))]
+    return [min(1.0 + spill, max(-spill, x)), min(1.0 + spill, max(-spill, y))]
 
 
 # ── Textured wax grease pencil shader ───────────────────────────────────────
@@ -1355,8 +1364,7 @@ def _px(rect: QRectF, pt: list[float]) -> QPointF:
 
 
 def _norm(rect: QRectF, x: float, y: float) -> list[float]:
-    return [min(1.0, max(0.0, (x - rect.x()) / max(1e-6, rect.width()))),
-            min(1.0, max(0.0, (y - rect.y()) / max(1e-6, rect.height())))]
+    return norm_in_rect(rect, QPointF(x, y), MARK_SPILL)
 
 
 def mark_bounds_px(mark: Mark, rect: QRectF) -> QRectF:
@@ -1401,9 +1409,11 @@ def _seg_dist(p: QPointF, a: QPointF, b: QPointF) -> float:
 
 
 def mark_hit(mark: Mark, rect: QRectF, pos: QPointF, tol: float = 9.0) -> bool:
-    """True if `pos` touches the mark (point glyph area, or near any of its strokes)."""
+    """True if `pos` touches the mark (point glyph area, or on / near any of its strokes)."""
     if is_point_mark(mark):
         return mark_bounds_px(mark, rect).adjusted(-4, -4, 4, 4).contains(pos)
+    pen = rect.width() * MARK_WIDTH * stroke_scale(mark.size, mark.kind) * PEN_LOOK.get(mark.style, PEN_LOOK[DEFAULT_PEN])[0]
+    tol = max(tol, pen / 2 + 4)  # a thick stroke can be grabbed anywhere on it
     for poly in mark_polylines(mark, rect):
         for a, b in zip(poly, poly[1:]):
             if _seg_dist(pos, a, b) <= tol:
@@ -1418,7 +1428,7 @@ def fit_point_mark(mark: Mark, rect: QRectF, anchor: QPointF, pos: QPointF, min_
     if side <= min_drag:
         return False
     unit = max(1.0, point_unit(mark, rect))
-    mark.size = max(0.25, min(8.0, size_for_glyph(side / 2 / unit)))
+    mark.size = max(0.25, min(20.0, size_for_glyph(side / 2 / unit)))  # up to the whole frame
     r = unit * glyph_scale(mark.size)
     mark.pts = [_norm(rect, anchor.x() + math.copysign(r, dx or 1.0), anchor.y() + math.copysign(r, dy or 1.0))]
     return True
@@ -1462,8 +1472,9 @@ def smooth_line(npts: list[list[float]], rect: QRectF) -> list[list[float]]:
 
 def move_mark(mark: Mark, pts0: list[list[float]], dx: float, dy: float) -> None:
     xs, ys = [p[0] for p in pts0], [p[1] for p in pts0]
-    dx = max(-min(xs), min(1.0 - max(xs), dx))
-    dy = max(-min(ys), min(1.0 - max(ys), dy))
+    lo, hi = -MARK_SPILL, 1.0 + MARK_SPILL
+    dx = max(lo - min(xs), min(hi - max(xs), dx))
+    dy = max(lo - min(ys), min(hi - max(ys), dy))
     mark.pts = [[p[0] + dx, p[1] + dy] for p in pts0]
 
 
@@ -3504,10 +3515,6 @@ def paint_frame_clean(p: QPainter, cell: QRectF, rebate_h: float, number: str, m
         else:
             img = fit_rect(slot, aspect)
         p.drawPixmap(img, pm, QRectF(pm.rect()))
-        if marked is not None:
-            width = max(1.5, img.width() * MARK_WIDTH)
-            for mk in marked.marks:
-                draw_mark(p, mk, img, width)
         if turn:
             p.restore()
             img = outer
@@ -3517,6 +3524,28 @@ def paint_frame_clean(p: QPainter, cell: QRectF, rebate_h: float, number: str, m
     p.setPen(QPen(QColor("#000000") if ink_saver else QColor("#1C1C1C"), max(1.0, cell.width() * 0.004)))
     p.setBrush(Qt.NoBrush)
     p.drawRect(cell)
+    p.restore()
+
+
+def paint_frame_marks(p: QPainter, cell: QRectF, rebate_h: float, pm: Optional[QPixmap], fr: Frame,
+                      sideways: bool = False) -> None:
+    """A printed frame's grease marks, placed exactly as paint_frame_clean placed the photo."""
+    if pm is None or pm.height() <= 0 or not fr.marks:
+        return
+    slot = frame_slot_rect(cell, rebate_h)
+    aspect = pm.width() / pm.height()
+    p.save()
+    if sideways and aspect < 1.0:
+        outer = fit_rect(slot, 1.0 / aspect)
+        p.translate(outer.center())
+        p.rotate(-90)
+        img = QRectF(-outer.height() / 2, -outer.width() / 2, outer.height(), outer.width())
+    else:
+        img = fit_rect(slot, aspect)
+    p.setClipRect(spill_rect(img), Qt.IntersectClip)
+    width = max(1.5, img.width() * MARK_WIDTH)
+    for mk in fr.marks:
+        draw_mark(p, mk, img, width)
     p.restore()
 
 
@@ -3629,6 +3658,12 @@ def paint_sheet_page(p: QPainter, rect: QRectF, lay: SheetLayout, job: SheetJob,
             fr = job.roll.frames[i]
             paint_frame_clean(p, cell, lay.rebate_h, job.roll.label(i), job.meta, job.pixmap_for(fr),
                               job.ink_saver, fr if job.marks else None, job.sideways)
+    if job.marks:  # grease goes on after every frame, so it may run onto the film around a photo
+        for k in range(min(lay.per_page, n - first)):
+            r, c = divmod(k, lay.cols)
+            cell = QRectF(rect.x() + lay.x0 + c * lay.cell_w, rect.y() + lay.y0 + r * lay.cell_h, lay.cell_w, lay.cell_h)
+            fr = job.roll.frames[shown[first + k]]
+            paint_frame_marks(p, cell, lay.rebate_h, job.pixmap_for(fr), fr, job.sideways)
 
 
 def render_contact_sheet(printer: Any, job: SheetJob) -> int:
@@ -4650,6 +4685,12 @@ class ContactSheetCanvas(QAbstractScrollArea):
                     p.fillRect(cell, C_FILM)
                     continue
                 self._paint_cell(p, self.order[k])
+        # Marks go on after every frame, like grease on a finished sheet: they may run onto the film.
+        for row in range(first, last + 1):
+            for col in range(self.columns):
+                k = row * self.columns + col
+                if k < len(self.order):
+                    self._paint_cell_marks(p, self.order[k])
         p.restore()
         if self.compare:
             self._paint_compare(p, vw)
@@ -4683,6 +4724,19 @@ class ContactSheetCanvas(QAbstractScrollArea):
         return (ov is not None and ov.isVisible()
                 and ov.mask().contains(ov.mapFromGlobal(QCursor.pos())))
 
+    def _paint_cell_marks(self, p: QPainter, i: int) -> None:
+        img = self._image_rect(i)
+        marks = self._marks_with_drag(i)
+        if not marks and not (self.sel is not None and self.sel[0] == i):
+            return
+        p.save()
+        p.setClipRect(spill_rect(img), Qt.IntersectClip)
+        width = max(1.5, img.width() * MARK_WIDTH)
+        for mk in marks:
+            draw_mark(p, mk, img, width)
+        p.restore()
+        self._paint_selection(p, i, img)
+
     def _paint_cell(self, p: QPainter, i: int) -> None:
         fr = self.frames[i]
         cell = self._cell_rect(i)
@@ -4699,10 +4753,6 @@ class ContactSheetCanvas(QAbstractScrollArea):
         else:
             p.setPen(QColor("#555555"))
             p.drawText(slot, Qt.AlignCenter, "can't open" if fr.error else "loading…")
-        width = max(1.5, img.width() * MARK_WIDTH)
-        for mk in self._marks_with_drag(i):
-            draw_mark(p, mk, img, width)
-        self._paint_selection(p, i, img)
         paint_frame_badges(p, slot, img, fr)
         self._paint_rebate(p, i, cell)
         p.setPen(QPen(QColor("#1C1C1C"), 1))
@@ -4859,6 +4909,12 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 self._begin_edit(idx, sel_mark, "move", pos, rect)
                 self.viewport().update()
                 return
+            if self.tool != T_ADJUST and mark_hit(sel_mark, rect, pos):
+                # Pressing on the mark just drawn picks it up: drag moves it; a plain click still zooms.
+                self._begin_edit(idx, sel_mark, "move", pos, rect)
+                self._edit["click"] = {"idx": idx, "pos": QPointF(pos)}
+                self.viewport().update()
+                return
         # 2) Adjust tool: pick the topmost mark under the cursor and start moving it
         if self.tool == T_ADJUST:
             picked = next((m for m in reversed(self.frames[idx].marks) if mark_hit(m, rect, pos)), None)
@@ -4915,8 +4971,9 @@ class ContactSheetCanvas(QAbstractScrollArea):
             self.focus = QPointF(min(1.0, max(0.0, self.focus.x() - d.x() / max(1.0, img.width()))),
                                  min(1.0, max(0.0, self.focus.y() - d.y() / max(1.0, img.height()))))
             self._pan_last = QPointF(pos)
-        elif self._edit is not None:
-            ed = self._edit
+        elif self._edit is not None and not ("click" in self._edit and not self._edit["moved"] and (
+                pos - self._edit["start"]).manhattanLength() < QApplication.startDragDistance()):
+            ed = self._edit  # (a mark picked up with a click only moves once it's really dragged)
             mk: Mark = ed["mark"]
             rect = self._rect_for(ed["idx"])
             if ed["mode"] == "move":
@@ -4939,7 +4996,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
                     return
                 rect = self._rect_for(idx)
                 is_point = self.tool in POINT_TOOLS
-                n0 = norm_in_rect(rect, start)
+                n0 = norm_in_rect(rect, start, MARK_SPILL)
                 pts = [n0] if (is_point or self.tool == T_LINE) else [n0, list(n0)]
                 self._drag = {"idx": idx, "point": is_point, "start": QPointF(start),
                               "mark": Mark(self.tool, pts, random.getrandbits(31), self.brush_size,
@@ -4948,13 +5005,13 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 return
         elif self._drag is not None:
             rect = self._rect_for(self._drag["idx"])
-            n = norm_in_rect(rect, pos)
+            n = norm_in_rect(rect, pos, MARK_SPILL)
             mark: Mark = self._drag["mark"]
             if self._drag["point"]:
                 # Like the ring: the press point is one corner, the cursor the opposite one.
                 start = self._drag["start"]
                 if not fit_point_mark(mark, rect, start, pos):
-                    mark.pts = [norm_in_rect(rect, start)]
+                    mark.pts = [norm_in_rect(rect, start, MARK_SPILL)]
                     mark.size = self.brush_size
             elif mark.kind == T_LINE:
                 # Stabiliser ("lazy brush"): the pen trails the cursor on a short string, so hand shake
@@ -4968,7 +5025,7 @@ class ContactSheetCanvas(QAbstractScrollArea):
                     self._drag["pen"] = pen
                     last = _px(rect, mark.pts[-1])
                     if math.hypot(pen.x() - last.x(), pen.y() - last.y()) > 1.5:
-                        mark.pts.append(norm_in_rect(rect, pen))
+                        mark.pts.append(norm_in_rect(rect, pen, MARK_SPILL))
             else:
                 mark.pts[1] = n
         elif not self.loupe_locked:
@@ -5007,6 +5064,9 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 mk = ed["mark"]
                 self._record(("edit", ed["idx"], mk, (ed["pts"], ed["size"]), ([list(q) for q in mk.pts], mk.size)))
                 self.marksChanged.emit(ed["idx"])
+            elif "click" in ed:  # picked up the mark but never moved it: an ordinary click
+                self._pending_click = ed["click"]
+                self._click_timer.start(QApplication.doubleClickInterval())
         if e.button() == Qt.LeftButton and self._drag is not None:
             mark: Mark = self._drag["mark"]
             idx: int = self._drag["idx"]
@@ -5024,9 +5084,8 @@ class ContactSheetCanvas(QAbstractScrollArea):
                 valid = diag > 6.0  # only a real drag draws
             if valid:
                 self._add_mark(idx, mark)
-                if mark.kind not in POINT_TOOLS:  # boxes / arrows / lines stay selected so they can be tweaked
-                    self.sel = (idx, mark)
-                    self.status.emit("Drag the handles to resize  •  E = Adjust tool to move  •  Del removes  •  Esc deselects")
+                self.sel = (idx, mark)  # the new mark stays picked up so it can be moved or resized
+                self.status.emit("Drag the mark to move it  •  drag its handles to resize  •  Del removes  •  Esc deselects")
         self.viewport().update()
 
     def mouseDoubleClickEvent(self, e) -> None:  # noqa: N802
@@ -5448,8 +5507,9 @@ KEYS_TEXT = (
     "In Mark mode, Space or right-click enlarges the frame so you can mark it up close\n\n"
     "PLACING MARKS\n"
     "Click places at the brush size.  Click-drag draws every mark from the corner you press\n"
-    "towards the cursor, like a box.  Box, arrow and line stay selected so you can drag\n"
-    "their handles.  Adjust tool: click a mark, drag to move, drag handles to resize.\n"
+    "towards the cursor, like a box.  The mark you just drew stays selected: drag it to move it,\n"
+    "drag its handles to resize.  Marks may run a little onto the film around the photo.\n"
+    "Adjust tool: click any mark, drag to move, drag handles to resize.\n"
     "Arrow keys nudge a selected mark (Shift = bigger steps), Esc deselects.\n\n"
     "BRUSH\n[ / ]  Smaller / larger     Alt+1-4  Red / Toxic green / Silver / Yellow\n"
     "Pen menu: wax pencil, china marker, felt marker or standard line\n\n"
