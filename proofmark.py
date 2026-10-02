@@ -76,8 +76,8 @@ Image.MAX_IMAGE_PIXELS = None
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME = "ProofMark"
-APP_VERSION = "1.4.0"
-BUILD_NUMBER = 12
+APP_VERSION = "1.5.0"
+BUILD_NUMBER = 13
 BUILD_DATE = "2026-10-01"
 RELEASE_CHANNEL = "stable"
 APP_ID = "io.github.shammer03.ProofMark"  # reverse-DNS id used by Flatpak / AppStream; change to your own
@@ -87,6 +87,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Newest first. `release.py bump` inserts new entries at the marker.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
     # <changelog-insert>
+    ("1.5.0", "2026-10-01", [
+        'Thicker grease marks that look hand-drawn',
+        'Drag the mark you just drew to move it',
+        'Marks can cover the whole frame and run onto the film',
+        'Stars and rejects can be drawn as large as the frame',
+        'Window title shows the roll; recent rolls show short names']),
     ("1.4.0", "2026-10-01", [
         'New app icon',
         'Import several rolls at once; Import button and welcome screen',

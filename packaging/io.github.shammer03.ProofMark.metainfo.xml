@@ -33,6 +33,9 @@
   <url type="homepage">https://github.com/shammer03/ProofMark</url>
   <url type="bugtracker">https://github.com/shammer03/ProofMark/issues</url>
   <releases>
+    <release version="1.5.0" date="2026-10-01">
+      <description><ul><li>Thicker grease marks that look hand-drawn</li><li>Drag the mark you just drew to move it</li><li>Marks can cover the whole frame and run onto the film</li><li>Stars and rejects can be drawn as large as the frame</li><li>Window title shows the roll; recent rolls show short names</li></ul></description>
+    </release>
     <release version="1.4.0" date="2026-10-01">
       <description><ul><li>New app icon</li><li>Import several rolls at once; Import button and welcome screen</li><li>The wheel scrolls the sheet; Ctrl+wheel zooms</li><li>Show scanned negatives as positives</li><li>Faster reopening of rolls</li></ul></description>
     </release>
