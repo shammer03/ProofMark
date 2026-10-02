@@ -5320,8 +5320,8 @@ class RollPage(QWidget):
             return
         self.canvas.set_positive(dlg.wants_positive)
         win = self.window()
-        if hasattr(win, "_show_positive_state"):
-            win._show_positive_state()
+        if hasattr(win, "_show_roll_state"):
+            win._show_roll_state()
         self.roll.save_info()
         self.title_label.setText(f"ROLL  {self.roll.display_title}")
         self._mark_info_button()
@@ -5402,7 +5402,7 @@ KEYS_TEXT = (
 class MainWindow(QMainWindow):
     def __init__(self, cfg: Optional[ConfigStore] = None) -> None:
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
+        self.setWindowTitle("")  # Qt adds " — ProofMark"; the open roll's name goes in front
         screen = QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen else QRect(0, 0, 1280, 800)
         self.setMinimumSize(720, 480)
@@ -5982,8 +5982,9 @@ class MainWindow(QMainWindow):
             page.canvas.set_positive(on)
             self.statusBar().showMessage("Negatives shown as positives" if on else "Showing the scans as they are", 4000)
 
-    def _show_positive_state(self) -> None:
+    def _show_roll_state(self) -> None:
         page = self.current_page()
+        self.setWindowTitle(page.roll.display_title if page is not None else "")
         self.positive_action.blockSignals(True)
         self.positive_action.setChecked(bool(page and page.roll.positive))
         self.positive_action.setEnabled(page is not None)
@@ -5991,7 +5992,7 @@ class MainWindow(QMainWindow):
 
     def _tab_changed(self, _i: int) -> None:
         page = self.current_page()
-        self._show_positive_state()
+        self._show_roll_state()
         if page:
             self._canvas_compare_changed(page.canvas.compare)
             page.canvas.setFocus()
@@ -6001,7 +6002,7 @@ class MainWindow(QMainWindow):
     def _refresh_central(self) -> None:
         """The welcome page while no roll is open, the roll tabs otherwise."""
         if hasattr(self, "positive_action"):
-            self._show_positive_state()
+            self._show_roll_state()
         if self.tabs.count():
             self.central.setCurrentWidget(self.tabs)
         else:

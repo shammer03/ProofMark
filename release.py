@@ -3,6 +3,7 @@
 ProofMark release helper (run from the project folder, no dependencies).
 
   ./release.py status                      show version, build, channel
+  ./release.py test                        run the test suite (also runs before every bump)
   ./release.py bump patch "Fixed X" "Added Y"   bump version (major|minor|patch), build += 1, add changelog lines
   ./release.py build                       build dist/: proofmark.py, .sha256, source tarball (for RPM / Flatpak)
   ./release.py icon                        redraw packaging/proofmark-512.png (needs PySide6)
@@ -65,7 +66,15 @@ def cmd_status() -> None:
     print(f"ProofMark {v} (build {b})")
 
 
+def cmd_test() -> bool:
+    """Run tests/ (off screen, in a throw-away home folder). True when everything passes."""
+    res = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(ROOT / "tests")], cwd=ROOT)
+    return res.returncode == 0
+
+
 def cmd_bump(part: str, notes: list[str]) -> None:
+    if not cmd_test():
+        sys.exit("Tests failed: fix them before releasing.")
     old, build = read_version()
     new = bump_version(old, part)
     today = datetime.date.today().isoformat()
@@ -130,6 +139,8 @@ def main() -> None:
         cmd_build()
     elif a[0] == "icon":
         cmd_icon()
+    elif a[0] == "test":
+        sys.exit(0 if cmd_test() else 1)
     else:
         print(__doc__)
 

@@ -19,6 +19,12 @@ ProofMark is non-destructive, like RapidRAW. For `photo.jpg` it writes only side
 
 exiftool is optional: it is only used to read RAW files' EXIF the first time a `.rrdata` is created.
 
+## Tests
+    python3 release.py test       # or: python3 -m unittest discover -s tests
+
+The tests draw off screen and use a throw-away home folder, so they never touch your settings,
+photos or Desktop. Every release bump runs them first.
+
 ## Release workflow
     ./release.py bump minor "What changed"    # version, build number, changelog, spec + AppStream
     git commit -am "Release vX.Y.Z" && git tag vX.Y.Z && git push --tags
