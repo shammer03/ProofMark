@@ -2617,7 +2617,9 @@ class WelcomePage(QWidget):
         folders = [f for f in self.win.cfg.data.get("recent_folders", []) if Path(f).is_dir()][:6]
         self.recent_title.setVisible(bool(folders))
         for f in folders:
-            b = QPushButton(f"{Path(f).name}     —     {f}")
+            p = Path(f)
+            b = QPushButton(f"{p.name}      ·  in {p.parent.name or p.parent}")
+            b.setToolTip(f)  # the full path only on hover
             b.setObjectName("recentRoll")
             b.setMinimumWidth(520)
             b.clicked.connect(lambda _c=False, path=f: self.win.open_roll(Path(path)))
@@ -6114,12 +6116,14 @@ class MainWindow(QMainWindow):
 
     def _fill_recent_menu(self) -> None:
         self.recent_menu.clear()
+        self.recent_menu.setToolTipsVisible(True)
         folders = [f for f in self.cfg.data.get("recent_folders", []) if Path(f).is_dir()]
         if not folders:
             self.recent_menu.addAction("(no recent rolls)").setEnabled(False)
         for f in folders:
-            self.recent_menu.addAction(f"{Path(f).name}    —    {f}").triggered.connect(
-                lambda _c=False, path=f: self.open_roll(Path(path)))
+            act = self.recent_menu.addAction(f"{Path(f).name}    —    {Path(f).parent.name or Path(f).parent}")
+            act.setToolTip(f)  # the full path only on hover
+            act.triggered.connect(lambda _c=False, path=f: self.open_roll(Path(path)))
         if folders:
             self.recent_menu.addSeparator()
             self.recent_menu.addAction("Clear Recent").triggered.connect(self._clear_recent)

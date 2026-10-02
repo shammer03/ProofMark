@@ -19,6 +19,12 @@
       <li>Never modifies your photos: marks, ratings and metadata go to sidecar files that RapidRAW and other XMP-aware apps read</li>
     </ul>
   </description>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/shammer03/ProofMark/main/docs/screenshots/contact-sheet.png</image>
+      <caption>A roll on the contact sheet, marked up with the grease pencil</caption>
+    </screenshot>
+  </screenshots>
   <launchable type="desktop-id">io.github.shammer03.ProofMark.desktop</launchable>
   <categories><category>Graphics</category><category>Photography</category></categories>
   <content_rating type="oars-1.1"/>

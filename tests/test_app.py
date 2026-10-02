@@ -11,7 +11,7 @@ from pathlib import Path
 from support import SheetDriver, make_roll, pm, pump, snapshot
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QToolButton
+from PySide6.QtWidgets import QApplication, QPushButton, QToolButton
 
 TEMPLATE = make_roll(Path(tempfile.mkdtemp()) / "template")
 
@@ -56,6 +56,16 @@ class OpeningRolls(AppTest):
         pump()
         self.assertIs(win.central.currentWidget(), win.welcome)
         self.assertEqual(win.windowTitle(), "")
+
+    def test_recent_rolls_show_names_not_full_paths(self) -> None:
+        win = self.d.win
+        win.close_tab(win.tabs.indexOf(self.d.page))
+        pump()
+        buttons = [w for w in win.welcome.findChildren(QPushButton) if w.objectName() == "recentRoll"]
+        self.assertTrue(buttons)
+        b = next(b for b in buttons if b.toolTip() == str(self.folder))
+        self.assertNotIn(str(self.folder.parent), b.text())
+        self.assertIn(self.folder.name, b.text())
 
     def test_import_button_comes_first(self) -> None:
         buttons = [w for w in self.d.win.tool_bar.findChildren(QToolButton) if w.objectName() == "importButton"]

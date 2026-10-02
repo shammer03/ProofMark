@@ -2,6 +2,8 @@
 
 Darkroom contact-sheet proofing with wax grease-pencil marks (Fedora, PySide6).
 
+![A roll on the contact sheet, marked up with the grease pencil](docs/screenshots/contact-sheet.png)
+
 ## Run
     sudo dnf install python3-pyside6 python3-pillow perl-Image-ExifTool
     pip install --user rawpy        # optional, for RAW files (Fedora has no python3-rawpy package)
