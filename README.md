@@ -9,6 +9,13 @@ Darkroom contact-sheet proofing with wax grease-pencil marks (Fedora, PySide6).
     pip install --user rawpy        # optional, for RAW files (Fedora has no python3-rawpy package)
     python3 proofmark.py            # python3 proofmark.py --version
 
+## If ProofMark won't start or crashes
+- Problems are recorded in `~/.config/proofmark/crash.log`. Attach it to an issue on GitHub.
+- If a library is missing, ProofMark says which `dnf install` command fixes it.
+- After it closes unexpectedly, ProofMark asks before reopening the previous rolls (the default is No).
+- After upgrading to a new Fedora version, reinstall rawpy: `pip install --user rawpy`.
+- To see errors as they happen, run it from a terminal: `python3 proofmark.py`
+
 ## Your files are never modified
 ProofMark is non-destructive, like RapidRAW. For `photo.jpg` it writes only sidecars next to it:
 

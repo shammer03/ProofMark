@@ -17,6 +17,7 @@ Module order (top-down execution safety):
 """
 from __future__ import annotations
 
+import faulthandler
 import hashlib
 import io
 import json
@@ -29,6 +30,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import traceback
 import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -36,7 +38,59 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from xml.sax.saxutils import escape, quoteattr
 
-from PIL import Image, ImageChops, ImageFilter, ImageOps
+CONFIG_DIR = Path.home() / ".config" / "proofmark"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+SESSION_FILE = CONFIG_DIR / "last_session.json"
+CRASH_LOG = CONFIG_DIR / "crash.log"
+RUNNING_FLAG = CONFIG_DIR / "running"  # present while ProofMark is open; left behind if it crashes
+
+
+def missing_library_help(exc: ImportError) -> str:
+    """What to tell the person when a library ProofMark needs is missing or broken."""
+    name = (exc.name or str(exc)).lower()
+    if name.startswith("pil"):
+        pkg = "python3-pillow"
+    elif "pyside" in name or "shiboken" in name or "qt" in name:
+        pkg = "python3-pyside6"
+    else:
+        pkg = "python3-pyside6 python3-pillow"
+    return (f"ProofMark can't start because a library it needs is missing or broken:\n\n{exc}\n\n"
+            f"To fix it, open a Terminal and run:\n\n    sudo dnf install {pkg}\n\n"
+            f"Then open ProofMark again.")
+
+
+def _startup_failed(exc: ImportError) -> None:
+    """Started from the app icon there is no terminal, so say what is wrong in a window and in crash.log."""
+    text = missing_library_help(exc)
+    print(text, file=sys.stderr)
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with CRASH_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n=== {APP_START} start-up ===\n{''.join(traceback.format_exception(exc))}")
+    except OSError:
+        pass
+    for cmd in (["zenity", "--error", "--title=ProofMark", "--no-markup", f"--text={text}"],
+                ["notify-send", "--app-name=ProofMark", "ProofMark can't start", text]):
+        try:
+            subprocess.run(cmd, check=False, timeout=600)
+            break
+        except (OSError, subprocess.SubprocessError):
+            continue
+    raise SystemExit(1)
+
+
+def _now() -> str:
+    import datetime
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+APP_START = _now()
+
+try:
+    from PIL import Image, ImageChops, ImageFilter, ImageOps
+    import PySide6.QtWidgets  # noqa: F401  (checked here so a broken Qt gets a clear message)
+except ImportError as _exc:
+    _startup_failed(_exc)
 
 try:
     import rawpy  # type: ignore
@@ -54,8 +108,8 @@ except ImportError:  # pragma: no cover
     QPrintDialog = None  # type: ignore[assignment,misc]
     QPrinter = None  # type: ignore[assignment,misc]
 
-from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QThread,
-                            QTimer, Signal)
+from PySide6.QtCore import (QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QThread,
+                            QTimer, QtMsgType, Signal, qInstallMessageHandler)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontMetrics,
                            QIcon, QLinearGradient, QImage, QPainter, QPainterPath, QPen,
                            QPixmap, QTransform, QRegion, QCursor, QMouseEvent, QWheelEvent)
@@ -208,10 +262,6 @@ DEV_INFO = {
             "the contact sheet and marking stars, rejects and crops with a grease pencil. ProofMark "
             "brings that workflow to the screen."),
 }
-CONFIG_DIR = Path.home() / ".config" / "proofmark"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-SESSION_FILE = CONFIG_DIR / "last_session.json"
-
 THUMB_W, THUMB_H = 450, 320
 PREVIEW_W, PREVIEW_H = 1920, 1440
 
@@ -3160,6 +3210,17 @@ def load_preview(path: Path) -> Image.Image:
     return preview
 
 
+def logs_errors(run: Callable[[Any], None]) -> Callable[[Any], None]:
+    """For QThread.run: PySide never passes an error there to sys.excepthook, and the thread then
+    never finishes (closing ProofMark would wait for it forever). Log it and let the thread end."""
+    def wrapper(self: Any) -> None:
+        try:
+            run(self)
+        except Exception:
+            sys.excepthook(*sys.exc_info())
+    return wrapper
+
+
 class ImageLoaderThread(QThread):
     """Decodes thumbnails (450x320) and previews (1920x1440) off the UI thread."""
 
@@ -3176,6 +3237,7 @@ class ImageLoaderThread(QThread):
     def stop(self) -> None:
         self._abort = True
 
+    @logs_errors
     def run(self) -> None:
         total = len(self.paths)
         global _cache_pruned
@@ -3229,6 +3291,7 @@ class RapidSyncWorker(QThread):
         self._running = False
         self._queue.put(None)
 
+    @logs_errors
     def run(self) -> None:
         while self._running:
             job = self._queue.get()
@@ -3246,8 +3309,12 @@ class RapidSyncWorker(QThread):
                 batch[nxt.path] = nxt
             totals = {"rapidraw": 0, "xmp": 0, "warn": 0}
             for j in batch.values():
-                for k, v in self._process(j).items():
-                    totals[k] += v
+                try:
+                    for k, v in self._process(j).items():
+                        totals[k] += v
+                except Exception:  # one bad frame must not stop syncing for the rest of the session
+                    sys.excepthook(*sys.exc_info())
+                    totals["warn"] += 1
             msg = f"Synced {len(batch)} frame(s)"
             if self.rapidraw_exif:
                 msg += f"  ·  RapidRAW sidecars updated: {totals['rapidraw']}"
@@ -3374,6 +3441,7 @@ class UpdateCheckWorker(QThread):
         super().__init__(parent)
         self.repo = repo
 
+    @logs_errors
     def run(self) -> None:
         import urllib.request
         try:
@@ -3402,6 +3470,7 @@ class UpdateInstallWorker(QThread):
         self.latest = latest
         self.assets = assets
 
+    @logs_errors
     def run(self) -> None:
         try:
             if self.kind == "git":
@@ -5612,6 +5681,7 @@ class MainWindow(QMainWindow):
         self._upd_install: Optional[QThread] = None
         self._session_dirty = False
         self._session_ready = False
+        self.last_run_crashed = False  # set by main(); makes the restore question default to No
 
         self.sync_worker = RapidSyncWorker(self)
         self.sync_worker.status.connect(self._sync_reported)
@@ -6420,9 +6490,14 @@ class MainWindow(QMainWindow):
             rolls = state.get("rolls", [])
         except (OSError, ValueError):
             rolls, state = [], {}
-        if rolls and QMessageBox.question(
-                self, "Restore session", "Reopen previous contact sheet session?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes:
+        if self.last_run_crashed:  # don't walk straight back into whatever crashed it
+            text = ("ProofMark closed unexpectedly last time.\n\nReopen the previous contact sheet session? "
+                    "Choose No if it closed while those rolls were open.")
+            default = QMessageBox.No
+        else:
+            text, default = "Reopen previous contact sheet session?", QMessageBox.Yes
+        if rolls and QMessageBox.question(self, "Restore session", text,
+                                          QMessageBox.Yes | QMessageBox.No, default) == QMessageBox.Yes:
             self.set_view(str(state.get("view", "full")))
             self.filter_combo.setCurrentIndex(max(0, self.filter_combo.findData(state.get("filter", "all"))))
             self._apply_brush(float(state.get("brush_size", 1.0)), style=str(state.get("brush_style", DEFAULT_PEN)))
@@ -6894,6 +6969,99 @@ def install_desktop_integration(force: bool = False, desktop_shortcut: bool = Fa
         return False
 
 
+# ── crash log ─────────────────────────────────────────────────────────────
+CRASH_LOG_MAX = 200_000  # bytes; older entries are dropped at start-up
+
+
+def write_crash_log(text: str) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with CRASH_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n=== {_now()} · {APP_NAME} {APP_VERSION} · Python {sys.version.split()[0]} ===\n{text}")
+    except OSError:
+        pass
+
+
+def trim_crash_log() -> None:
+    """Keep only the newest part of crash.log so it never grows large."""
+    try:
+        data = CRASH_LOG.read_bytes()
+        if len(data) > CRASH_LOG_MAX:
+            CRASH_LOG.write_bytes(data[-CRASH_LOG_MAX:])
+    except OSError:
+        pass
+
+
+class CrashNotice(QObject):
+    """Records unexpected errors and tells the person once per run. Safe to call from any thread."""
+    raised = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.shown = False
+        self.raised.connect(self._show, Qt.QueuedConnection)
+
+    def excepthook(self, kind, exc, tb) -> None:
+        text = "".join(traceback.format_exception(kind, exc, tb))
+        print(text, file=sys.stderr, end="")
+        write_crash_log(text)
+        self.raised.emit(text)
+
+    def _show(self, text: str) -> None:
+        if self.shown or QApplication.instance() is None:
+            return
+        self.shown = True
+        box = QMessageBox(QMessageBox.Warning, "Something went wrong",
+                          "ProofMark ran into a problem. It will keep running, but if anything looks "
+                          "wrong, close it and open it again.\n\n"
+                          f"The details were saved to:\n{CRASH_LOG}\n\n"
+                          "If it keeps happening, please attach that file to a new issue on GitHub.",
+                          QMessageBox.Ok, QApplication.activeWindow())
+        box.setDetailedText(text)
+        box.open()
+
+
+def qt_message(kind, context, message: str) -> None:
+    """Qt's own warnings still go to the terminal; serious ones are also kept in crash.log."""
+    print(message, file=sys.stderr)
+    if kind in (QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
+        write_crash_log(f"Qt: {message}\n")
+
+
+def start_crash_logging() -> CrashNotice:
+    """Python errors and hard crashes (inside Qt, rawpy…) are written to crash.log."""
+    trim_crash_log()
+    notice = CrashNotice()
+    sys.excepthook = notice.excepthook
+    qInstallMessageHandler(qt_message)
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        fault_file = CRASH_LOG.open("a", encoding="utf-8")
+        notice.fault_file = fault_file  # kept open: faulthandler writes to it when the app dies
+        faulthandler.enable(file=fault_file, all_threads=True)
+    except OSError:
+        pass
+    return notice
+
+
+def mark_running() -> bool:
+    """Leave a flag while ProofMark is open. Returns True if the last run never removed it (a crash)."""
+    crashed = RUNNING_FLAG.exists()
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        RUNNING_FLAG.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    except OSError:
+        pass
+    return crashed
+
+
+def mark_closed() -> None:
+    try:
+        RUNNING_FLAG.unlink()
+    except OSError:
+        pass
+
+
 def main() -> int:
     if "--version" in sys.argv:
         print(f"{APP_NAME} {version_string(True)}")
@@ -6912,6 +7080,7 @@ def main() -> int:
     QApplication.setApplicationVersion(APP_VERSION)
     QApplication.setDesktopFileName(APP_ID if kind in ("flatpak", "system") else "proofmark")
     app = QApplication(sys.argv)
+    notice = start_crash_logging()  # noqa: F841  (must live as long as the app)
     # A little quicker than the desktop's double-click time: a Mark-mode click waits this long
     # before zooming (in case a second click makes it a double-click), and Qt uses the same value.
     app.setDoubleClickInterval(max(200, int(QApplication.doubleClickInterval() * 0.8)))
@@ -6932,16 +7101,21 @@ def main() -> int:
         cfg.save()
     app.setWindowIcon(QIcon(build_icon_pixmap(256)))
     win = MainWindow(cfg)
+    win.last_run_crashed = mark_running()
     win.showMaximized()  # fills the screen but keeps the title bar (move / resize / close); F11 = true full screen
     QTimer.singleShot(0, win.offer_session_restore)
     QTimer.singleShot(5000, win._auto_update_check)
     # Ctrl+C in the terminal: close the window normally (saves the session and sidecars).
     # Python only sees the signal when it runs some code, so a timer wakes it periodically.
+    # Logging out sends SIGTERM: close the same way, so it isn't mistaken for a crash next time.
     signal.signal(signal.SIGINT, lambda *_a: win.close())
+    signal.signal(signal.SIGTERM, lambda *_a: (mark_closed(), win.close()))
     wake = QTimer()
     wake.timeout.connect(lambda: None)
     wake.start(250)
-    return app.exec()
+    result = app.exec()
+    mark_closed()
+    return result
 
 
 if __name__ == "__main__":
