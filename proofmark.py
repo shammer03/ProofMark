@@ -256,11 +256,13 @@ T_LINE = "line"
 T_ARROW = "arrow"
 T_RING = "ring"
 T_ADJUST = "adjust"
-BRUSH_COLORS = [("Red", "#FF3B30"), ("Toxic Green", "#39FF14"),
-                ("Silver", "#E6E6EA"), ("Yellow", "#FFE600")]
-DEFAULT_BRUSH_COLOR = BRUSH_COLORS[0][1]
+BRUSH_COLORS = [("Toxic Green", "#39FF14"), ("Silver", "#E6E6EA"),
+                ("Yellow", "#FFE600"), ("Red", "#FF3B30")]   # best to worst; keys 1-4
+DEFAULT_BRUSH_COLOR = "#39FF14"  # the pencil ProofMark starts with (Settings ▸ Contact Sheet)
+MARK_COLOR_FALLBACK = "#FF3B30"  # marks saved before wax colours existed were red
 # Rating a Star mark gives, by wax colour (Settings ▸ Files & Sync can change these)
-DEFAULT_STAR_RATINGS = {"#FF3B30": 5, "#39FF14": 5, "#FFE600": 4, "#E6E6EA": 3}
+DEFAULT_STAR_RATINGS = {"#39FF14": 5, "#E6E6EA": 4, "#FFE600": 3, "#FF3B30": 2}
+OLD_STAR_RATINGS = {"#FF3B30": 5, "#39FF14": 5, "#FFE600": 4, "#E6E6EA": 3}  # defaults up to v1.5.0
 STAR_RATINGS: dict[str, int] = dict(DEFAULT_STAR_RATINGS)
 PEN_STYLES = [("wax", "Wax pencil"), ("china", "China marker"), ("marker", "Felt marker"), ("standard", "Standard")]
 PEN_NAMES = dict(PEN_STYLES)
@@ -425,7 +427,7 @@ class Mark:
     pts: list[list[float]]
     seed: int
     size: float = 1.0
-    color: str = DEFAULT_BRUSH_COLOR
+    color: str = MARK_COLOR_FALLBACK
     style: str = DEFAULT_PEN
 
     def to_dict(self) -> dict[str, Any]:
@@ -436,7 +438,7 @@ class Mark:
     def from_dict(d: dict[str, Any]) -> "Mark":
         style = str(d.get("style", DEFAULT_PEN))
         return Mark(str(d["kind"]), [[float(p[0]), float(p[1])] for p in d.get("pts", [])],
-                    int(d.get("seed", 1)), float(d.get("size", 1.0)), str(d.get("color", DEFAULT_BRUSH_COLOR)),
+                    int(d.get("seed", 1)), float(d.get("size", 1.0)), str(d.get("color", MARK_COLOR_FALLBACK)),
                     style if style in PEN_NAMES else DEFAULT_PEN)
 
 
@@ -851,7 +853,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "menu_mode": "top", "toolbar_area": "top", "rebate_scale": 100,
     "default_columns": 6, "hover_loupe": True,
     "autosave_secs": 4, "sync_mode": "auto", "sync_delay": 2, "rapidraw_exif": True, "xmp_sync": True,
-    "star_ratings": dict(DEFAULT_STAR_RATINGS), "print_marks": False, "tray_icon": True,
+    "star_ratings": dict(DEFAULT_STAR_RATINGS), "brush_color": DEFAULT_BRUSH_COLOR, "print_marks": False, "tray_icon": True,
     "sideways_verticals": True, "number_style": "edge", "number_start": 1,
     "export_mode": "ask", "export_folder": str(Path.home() / "Pictures" / "Contact Sheets"),
     "export_format": "jpg", "export_size": 8000, "export_fullres": False,
@@ -873,6 +875,7 @@ class ConfigStore:
         self.renames: list[tuple[str, str, str]] = []  # (kind, old, new) pending for open rolls
         self.load()
         self._migrate_gear()
+        self._migrate_star_ratings()
 
     @staticmethod
     def _defaults() -> dict[str, Any]:
@@ -917,6 +920,13 @@ class ConfigStore:
                 self.profile[k] = ""
         self.data["gear_version"] = GEAR_VERSION
         self.save()
+
+    def _migrate_star_ratings(self) -> None:
+        """Untouched old star ratings move to the new Green 5 → Red 2 scale; custom ones are kept."""
+        saved = self.data.get("star_ratings")
+        if isinstance(saved, dict) and {str(k).upper(): v for k, v in saved.items()} == OLD_STAR_RATINGS:
+            self.data["star_ratings"] = dict(DEFAULT_STAR_RATINGS)
+            self.save()
 
     @property
     def mounts(self) -> dict[str, str]:
@@ -2366,7 +2376,15 @@ class SettingsDialog(QDialog):
         self.num_style.setCurrentIndex(max(0, self.num_style.findData(s("number_style"))))
         self.num_start = self._spin(0, 99, int(s("number_start")), "")
         self.num_start.setToolTip("Many rolls start at 0 or 00; 35 mm usually counts 1-36")
+        self.start_color = QComboBox()
+        for cname, chex in BRUSH_COLORS:
+            swatch = QPixmap(16, 16)
+            swatch.fill(QColor(chex))
+            self.start_color.addItem(QIcon(swatch), cname, chex)
+        self.start_color.setCurrentIndex(max(0, self.start_color.findData(str(s("brush_color")).upper())))
+        self.start_color.setToolTip("The wax colour the pencil has when ProofMark opens")
         fc.addRow("Columns in Full screen view", self.cols)
+        fc.addRow("Pencil starts in", self.start_color)
         fc.addRow("Frame numbers", self.num_style)
         fc.addRow("First frame number", self.num_start)
         fc.addRow(self.hover_loupe)
@@ -2552,6 +2570,7 @@ class SettingsDialog(QDialog):
             "sync_delay": self.sync_delay.value(),
             "rapidraw_exif": self.rapidraw_exif.isChecked(), "xmp_sync": self.xmp_sync.isChecked(),
             "star_ratings": {h: sp.value() for h, sp in self.star_spins.items()},
+            "brush_color": self.start_color.currentData(),
             "print_marks": self.print_marks.isChecked(),
             "print_direct": self.print_direct.isChecked(), "print_ink_saver": bool(self.sheet_style.currentData()),
             "sideways_verticals": self.sideways.isChecked(),
@@ -5550,7 +5569,7 @@ KEYS_TEXT = (
     "drag its handles to resize.  Marks may run a little onto the film around the photo.\n"
     "Adjust tool: click any mark, drag to move, drag handles to resize.\n"
     "Arrow keys nudge a selected mark (Shift = bigger steps), Esc deselects.\n\n"
-    "BRUSH\n[ / ]  Smaller / larger     Alt+1-4  Red / Toxic green / Silver / Yellow\n"
+    "BRUSH\n[ / ]  Smaller / larger     Alt+1-4  Toxic green / Silver / Yellow / Red\n"
     "Pen menu: wax pencil, china marker, felt marker or standard line\n\n"
     "CULLING  (acts on the frame under the mouse, or the highlighted one after arrow keys)\n"
     "Arrow keys / Home / End  Move between frames     1-5  Rate     0  Clear rating\n"
@@ -5628,6 +5647,7 @@ class MainWindow(QMainWindow):
             self.cfg.set_setting("sideways_verticals", True)
             self.cfg.data["sideways_default_on"] = True
             self.cfg.save()
+        self.start_color: Optional[str] = None  # the "Pencil starts in" setting last applied
         self.tray: Optional[QSystemTrayIcon] = None
         if QSystemTrayIcon.isSystemTrayAvailable():  # GNOME needs the AppIndicator extension for this
             self.tray = QSystemTrayIcon(QIcon(build_icon_pixmap(64)), self)
@@ -6405,8 +6425,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes:
             self.set_view(str(state.get("view", "full")))
             self.filter_combo.setCurrentIndex(max(0, self.filter_combo.findData(state.get("filter", "all"))))
-            self._apply_brush(float(state.get("brush_size", 1.0)), state.get("brush_color", DEFAULT_BRUSH_COLOR),
-                              str(state.get("brush_style", DEFAULT_PEN)))
+            self._apply_brush(float(state.get("brush_size", 1.0)), style=str(state.get("brush_style", DEFAULT_PEN)))
             if state.get("tool") in self.tool_actions and state.get("tool") != T_INSPECT:
                 self.mark_tool = state["tool"]  # remembered for the Mark button; ProofMark opens in Loupe mode
             self.set_tool(T_INSPECT)
@@ -6482,6 +6501,10 @@ class MainWindow(QMainWindow):
         self.ink_action.blockSignals(True)
         self.ink_action.setChecked(bool(c.setting("print_ink_saver")))
         self.ink_action.blockSignals(False)
+        start = str(c.setting("brush_color")).upper()
+        if start != self.start_color:  # at launch, and when the setting is changed
+            self.start_color = start
+            self._apply_brush(color=start)
         STAR_RATINGS.clear()
         STAR_RATINGS.update(DEFAULT_STAR_RATINGS)
         STAR_RATINGS.update({str(k).upper(): int(v) for k, v in (c.setting("star_ratings") or {}).items()})

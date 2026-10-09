@@ -207,6 +207,19 @@ class Marking(AppTest):
             self.assertAlmostEqual(got[0], want[0])
             self.assertAlmostEqual(got[1], want[1])
 
+    def test_pencil_starts_in_the_chosen_colour(self) -> None:
+        win, cfg = self.d.win, self.d.win.cfg
+        self.assertEqual(win.brush_color, pm.DEFAULT_BRUSH_COLOR)
+        win._apply_brush(color="#FFE600")          # picking another colour while marking is kept...
+        cfg.set_setting("brush_color", "#E6E6EA")
+        win.apply_settings()                       # ...until the setting itself is changed
+        self.assertEqual(win.brush_color, "#E6E6EA")
+        self.assertEqual(self.c.brush_color, "#E6E6EA")
+        win._apply_brush(color="#FFE600")
+        win.apply_settings()                       # other settings saved: the current colour stays
+        self.assertEqual(win.brush_color, "#FFE600")
+        self.assertEqual(pm.Mark.from_dict({"kind": pm.T_STAR, "pts": [[.5, .5]]}).color, "#FF3B30")
+
 
 class Viewing(AppTest):
     def test_click_switches_60_and_95(self) -> None:
