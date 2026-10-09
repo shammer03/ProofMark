@@ -130,9 +130,9 @@ Image.MAX_IMAGE_PIXELS = None
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME = "ProofMark"
-APP_VERSION = "1.5.0"
-BUILD_NUMBER = 13
-BUILD_DATE = "2026-10-01"
+APP_VERSION = "1.5.1"
+BUILD_NUMBER = 14
+BUILD_DATE = "2026-10-09"
 RELEASE_CHANNEL = "stable"
 APP_ID = "io.github.shammer03.ProofMark"  # reverse-DNS id used by Flatpak / AppStream; change to your own
 UPDATE_REPO = "shammer03/ProofMark"  # GitHub "owner/repo" that publishes releases (or set it in Settings ▸ Updates)
@@ -141,6 +141,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Newest first. `release.py bump` inserts new entries at the marker.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
     # <changelog-insert>
+    ("1.5.1", "2026-10-09", [
+        'Wax colours run Green, Silver, Yellow, Red; Star ratings follow (5, 4, 3, 2)',
+        "Choose the pencil's starting colour in Settings ▸ Contact Sheet",
+        'Problems are saved to a crash log; a missing library names the package to install',
+        'After an unexpected close, ProofMark asks before reopening the previous rolls']),
     ("1.5.0", "2026-10-01", [
         'Thicker grease marks that look hand-drawn',
         'Drag the mark you just drew to move it',
